@@ -3,7 +3,6 @@ use std::{
     error::Error,
     fs::File,
     io::{BufReader, Read},
-    os::raw::{c_int, c_uchar},
 };
 
 const BUFFER_SIZE: usize = 1 * 1024;
@@ -316,13 +315,13 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
 
 #[no_mangle]
 pub extern "C" fn helium_c(
-    #[cfg(windows)] file_name: *const std::os::raw::c_ushort,
-    #[cfg(unix)] file_name: *const std::os::raw::c_char,
-    width: *mut c_int,
-    height: *mut c_int,
-    num_channels: *mut c_int,
-    data: *mut *mut c_uchar,
-) -> c_int {
+    #[cfg(windows)] file_name: *const u16,
+    #[cfg(unix)] file_name: *const u8,
+    width: *mut i32,
+    height: *mut i32,
+    num_channels: *mut i32,
+    data: *mut *mut u8,
+) -> i32 {
     if file_name.is_null() {
         return -1;
     }
@@ -347,13 +346,13 @@ pub extern "C" fn helium_c(
         Some(file_name) => match helium(file_name) {
             Ok(i) => unsafe {
                 if !width.is_null() {
-                    *width = i.width as c_int;
+                    *width = i.width as i32;
                 }
                 if !height.is_null() {
-                    *height = i.height as c_int;
+                    *height = i.height as i32;
                 }
                 if !num_channels.is_null() {
-                    *num_channels = i.num_channels as c_int;
+                    *num_channels = i.num_channels as i32;
                 }
                 if !data.is_null() {
                     *data = i.data.leak().as_mut_ptr();
