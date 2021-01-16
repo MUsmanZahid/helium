@@ -3,11 +3,14 @@ use std::{
     error::Error,
     fs::File,
     io::{BufReader, Read},
-    sync::{mpsc::channel, Arc, Mutex},
+    sync::{
+        mpsc::{channel, Receiver},
+        Arc,
+    },
     thread,
 };
 
-const BUFFER_SIZE: usize = 1 * 1024;
+const BUFFER_SIZE: usize = 8 * 1024;
 const DISTANCES: [u32; 30] = [
     1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
     2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
@@ -45,15 +48,18 @@ struct BitBuffer {
     bits: u32,
     bit_count: u32,
     index: usize,
-    length: usize,
-    stream: Arc<Mutex<Vec<u8>>>,
+    receiver: Receiver<Arc<[u8; BUFFER_SIZE]>>,
+    stream: Arc<[u8; BUFFER_SIZE]>,
 }
 
 impl BitBuffer {
     fn bits(&mut self, count: u32) -> u32 {
         while self.bit_count < count {
-            self.bits |=
-                (self.stream.lock().expect("BB: Failed lock")[self.index] as u32) << self.bit_count;
+            if self.index == BUFFER_SIZE {
+                self.stream = self.receiver.recv().unwrap();
+                self.index = 0;
+            }
+            self.bits |= (self.stream[self.index] as u32) << self.bit_count;
             self.bit_count += 8;
             self.index += 1;
         }
@@ -258,19 +264,15 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
         _ => panic!("Invalid colour type"),
     };
 
-    let zlib_buffer = Arc::new(Mutex::new(Vec::new()));
-    let stream = Arc::clone(&zlib_buffer);
-    let (sender, receiver) = channel::<Arc<Mutex<Vec<u8>>>>();
-
-    let decoder = thread::spawn(move || {
-        let reading_buffer = receiver.recv().unwrap();
-
+    let (sender, receiver) = channel::<Arc<[u8; BUFFER_SIZE]>>();
+    let decoder = thread::Builder::new().name(String::from("decoder")).spawn(move || {
+        let stream = receiver.recv().unwrap();
         let mut bit_buffer = BitBuffer {
             bits: 0,
             bit_count: 0,
             index: 0,
-            length: BUFFER_SIZE,
-            stream
+            receiver,
+            stream,
         };
 
         // Skip first two bytes of zlib stream
@@ -318,7 +320,7 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
             "Did not decode the full image"
         );
         return decoded_stream;
-    });
+    })?;
 
     // Collect zlib stream
     let mut chunk_type = IHDR;
@@ -334,18 +336,17 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
         if chunk_type == IDAT {
             while bytes_read < length {
                 let bytes_to_read = usize::min(length - bytes_read, BUFFER_SIZE);
-                // Fill writing buffer
-                reader.read_exact(&mut buffer[..bytes_to_read])?;
-                crc = update_crc(crc, &buffers[writing_buffer][..bytes_to_read], &crc_table);
-
+                let mut buffer = Arc::new([0; BUFFER_SIZE]);
+                reader.read_exact(&mut Arc::get_mut(&mut buffer).unwrap()[..bytes_to_read])?;
+                sender.send(Arc::clone(&buffer)).unwrap();
+                crc = update_crc(crc, &buffer[..bytes_to_read], &crc_table);
                 bytes_read += bytes_to_read;
             }
         } else {
-
             while bytes_read < length {
                 let bytes_to_read = usize::min(length - bytes_read, BUFFER_SIZE);
-                reader.read_exact(&mut handle[..bytes_to_read])?;
-                crc = update_crc(crc, &handle[..bytes_to_read], &crc_table);
+                reader.read_exact(&mut buffer[..bytes_to_read])?;
+                crc = update_crc(crc, &buffer[..bytes_to_read], &crc_table);
                 bytes_read += bytes_to_read;
             }
         }
