@@ -1,13 +1,9 @@
-#![allow(dead_code)]
 use std::{
     convert::TryInto,
     error::Error,
     fs::File,
     io::{BufReader, Read},
-    sync::{
-        mpsc::{channel, Receiver},
-        Arc,
-    },
+    sync::{mpsc::channel, Arc, Mutex},
     thread,
 };
 
@@ -45,51 +41,19 @@ const LENGTH_EXTRA_BITS: [u32; 29] = [
 const MAGIC_NUMBER: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
 const NUM_8BIT_CRCS: usize = 256;
 
-struct BitBuffer<'s> {
+struct BitBuffer {
     bits: u32,
     bit_count: u32,
     index: usize,
     length: usize,
-    stream: &'s [u8],
+    stream: Arc<Mutex<Vec<u8>>>,
 }
 
-impl<'s> BitBuffer<'s> {
-    fn bits<'b>(&'b mut self, count: u32) -> u32 {
-        if self.bit_count < count {
-            let repeat = usize::min((32 - self.bit_count as usize) / 8, self.length - self.index);
-            for _ in 0..repeat {
-                self.bits |= (self.stream[self.index] as u32) << self.bit_count;
-                self.bit_count += 8;
-                self.index += 1;
-            }
-        }
-
-        let value = self.bits & ((1u32 << count) - 1);
-        self.bits >>= count;
-        self.bit_count -= count;
-
-        return value;
-    }
-}
-
-struct BitBufferMT {
-    bits: u32,
-    bit_count: u32,
-    index: usize,
-    length: usize,
-    receiver: Receiver<Arc<[u8; BUFFER_SIZE]>>,
-    stream: Arc<[u8; BUFFER_SIZE]>,
-}
-
-impl BitBufferMT {
+impl BitBuffer {
     fn bits(&mut self, count: u32) -> u32 {
         while self.bit_count < count {
-            if self.index == self.length {
-                self.stream = self.receiver.recv().unwrap();
-                self.index = 0;
-            }
-
-            self.bits |= (self.stream[self.index] as u32) << self.bit_count;
+            self.bits |=
+                (self.stream.lock().expect("BB: Failed lock")[self.index] as u32) << self.bit_count;
             self.bit_count += 8;
             self.index += 1;
         }
@@ -108,20 +72,7 @@ struct HuffmanCode {
 }
 
 impl HuffmanCode {
-    fn decode<'b, 's>(&'b self, bit_buffer: &'b mut BitBuffer<'s>) -> Option<&u32> {
-        let mut code = 0;
-        for bit in 0..self.codes.len() {
-            code = (code << 1) | bit_buffer.bits(1);
-            match self.map[bit].get((code - self.codes[bit]) as usize) {
-                None => (),
-                value => return value,
-            }
-        }
-
-        return None;
-    }
-
-    fn decode_mt(&self, bit_buffer: &mut BitBufferMT) -> Option<&u32> {
+    fn decode(&self, bit_buffer: &mut BitBuffer) -> Option<&u32> {
         let mut code = 0;
         for bit in 0..self.codes.len() {
             code = (code << 1) | bit_buffer.bits(1);
@@ -165,11 +116,11 @@ pub struct Image {
     pub data: Vec<u8>,
 }
 
-fn decode_block<'b, 's>(
-    bit_buffer: &'b mut BitBuffer<'s>,
-    decoded_stream: &'b mut Vec<u8>,
-    distance: &'b HuffmanCode,
-    literal_length: &'b HuffmanCode,
+fn decode_block(
+    bit_buffer: &mut BitBuffer,
+    decoded_stream: &mut Vec<u8>,
+    distance: &HuffmanCode,
+    literal_length: &HuffmanCode,
 ) {
     loop {
         match literal_length.decode(bit_buffer) {
@@ -202,44 +153,7 @@ fn decode_block<'b, 's>(
     }
 }
 
-fn decode_block_mt(
-    bit_buffer: &mut BitBufferMT,
-    decoded_stream: &mut Vec<u8>,
-    distance: &HuffmanCode,
-    literal_length: &HuffmanCode,
-) {
-    loop {
-        match literal_length.decode_mt(bit_buffer) {
-            Some(x @ 0..=255) => decoded_stream.push(*x as u8),
-            Some(256) => break,
-            Some(x @ 257..=285) => {
-                let length_index = *x as usize - 257;
-                let extra_bits = LENGTH_EXTRA_BITS[length_index];
-                let extra_length = bit_buffer.bits(extra_bits);
-                let length = LENGTHS[length_index] + extra_length;
-
-                // Get distance code
-                let distance_index = match distance.decode_mt(bit_buffer) {
-                    Some(x @ 0..=29) => *x as usize,
-                    _ => panic!("Invalid distance code!"),
-                };
-                let extra_bits = DISTANCE_EXTRA_BITS[distance_index];
-                let extra_distance = bit_buffer.bits(extra_bits);
-                let distance = DISTANCES[distance_index] + extra_distance;
-
-                let current_length = decoded_stream.len();
-                for i in 0..length {
-                    let index = current_length - distance as usize + i as usize;
-                    let value = decoded_stream[index];
-                    decoded_stream.push(value);
-                }
-            }
-            _ => panic!("Invalid literal/length code!"),
-        }
-    }
-}
-
-fn dynamic<'b, 's>(bit_buffer: &'b mut BitBuffer<'s>, decoded_stream: &'b mut Vec<u8>) {
+fn dynamic(bit_buffer: &mut BitBuffer, decoded_stream: &mut Vec<u8>) {
     let hlit = bit_buffer.bits(5) as usize + 257;
     let hdist = bit_buffer.bits(5) as usize + 1;
     let hclen = bit_buffer.bits(4) as usize + 4;
@@ -280,49 +194,6 @@ fn dynamic<'b, 's>(bit_buffer: &'b mut BitBuffer<'s>, decoded_stream: &'b mut Ve
     let literal_length = HuffmanCode::new(&ll_bit_lengths, 15);
     let distance = HuffmanCode::new(&distance_bit_lengths, 15);
     decode_block(bit_buffer, decoded_stream, &distance, &literal_length);
-}
-
-fn dynamic_mt(bit_buffer: &mut BitBufferMT, decoded_stream: &mut Vec<u8>) {
-    let hlit = bit_buffer.bits(5) as usize + 257;
-    let hdist = bit_buffer.bits(5) as usize + 1;
-    let hclen = bit_buffer.bits(4) as usize + 4;
-
-    let code_indices: [_; 19] = [
-        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
-    ];
-    let mut cc_bit_lengths = [0; 19];
-    (0..hclen).for_each(|i| cc_bit_lengths[code_indices[i]] = bit_buffer.bits(3));
-
-    let cc = HuffmanCode::new(&cc_bit_lengths, 7);
-    let mut code_lengths = vec![0; hlit + hdist];
-    let mut num_decoded = 0;
-    let mut last_code = 0;
-
-    while num_decoded < code_lengths.capacity() {
-        let (repeat, code_to_repeat) = match cc.decode_mt(bit_buffer) {
-            Some(x @ 0..=15) => (1, *x),
-            Some(16) => (3 + bit_buffer.bits(2), last_code),
-            Some(17) => (3 + bit_buffer.bits(3), 0),
-            Some(18) => (11 + bit_buffer.bits(7), 0),
-            _ => panic!("Dynamic Huffman: Unknown code for code lengths encountered"),
-        };
-
-        for _ in 0..repeat {
-            code_lengths[num_decoded] = code_to_repeat;
-            num_decoded += 1;
-        }
-
-        last_code = code_to_repeat;
-    }
-
-    let mut ll_bit_lengths = [0; 287];
-    ll_bit_lengths[..hlit].copy_from_slice(&code_lengths[..hlit]);
-    let mut distance_bit_lengths = [0; 32];
-    distance_bit_lengths[..hdist].copy_from_slice(&code_lengths[hlit..]);
-
-    let literal_length = HuffmanCode::new(&ll_bit_lengths, 15);
-    let distance = HuffmanCode::new(&distance_bit_lengths, 15);
-    decode_block_mt(bit_buffer, decoded_stream, &distance, &literal_length);
 }
 
 pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
@@ -387,21 +258,19 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
         _ => panic!("Invalid colour type"),
     };
 
-    // Set-up dual-array streaming buffer
-    let mut buffers = [Arc::new(buffer), Arc::new([0; BUFFER_SIZE])];
-    let mut writing_buffer = 0;
-    let (sender, receiver) = channel::<Arc<[u8; BUFFER_SIZE]>>();
+    let zlib_buffer = Arc::new(Mutex::new(Vec::new()));
+    let stream = Arc::clone(&zlib_buffer);
+    let (sender, receiver) = channel::<Arc<Mutex<Vec<u8>>>>();
 
     let decoder = thread::spawn(move || {
         let reading_buffer = receiver.recv().unwrap();
 
-        let mut bit_buffer = BitBufferMT {
+        let mut bit_buffer = BitBuffer {
             bits: 0,
             bit_count: 0,
             index: 0,
             length: BUFFER_SIZE,
-            receiver,
-            stream: reading_buffer,
+            stream
         };
 
         // Skip first two bytes of zlib stream
@@ -428,13 +297,13 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
 
                     (0..length).for_each(|_| decoded_stream.push(bit_buffer.bits(8) as u8));
                 }
-                1 => decode_block_mt(
+                1 => decode_block(
                     &mut bit_buffer,
                     &mut decoded_stream,
                     &fixed_distance,
                     &fixed_literal_length,
                 ),
-                2 => dynamic_mt(&mut bit_buffer, &mut decoded_stream),
+                2 => dynamic(&mut bit_buffer, &mut decoded_stream),
                 _ => panic!("Unknown Huffman compression format!"),
             }
 
@@ -465,29 +334,13 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
         if chunk_type == IDAT {
             while bytes_read < length {
                 let bytes_to_read = usize::min(length - bytes_read, BUFFER_SIZE);
-                // Get a mutable reference to the underlying buffer we will be writing to in this
-                // iteration.
-                let handle = loop {
-                    if let Some(b) = Arc::get_mut(&mut buffers[writing_buffer]) {
-                        break b;
-                    }
-                };
-
                 // Fill writing buffer
-                reader.read_exact(&mut handle[..bytes_to_read])?;
-                // Send a strong reference to the decoder thread
-                sender.send(Arc::clone(&buffers[writing_buffer]))?;
+                reader.read_exact(&mut buffer[..bytes_to_read])?;
                 crc = update_crc(crc, &buffers[writing_buffer][..bytes_to_read], &crc_table);
 
-                writing_buffer = (writing_buffer + 1) & 1;
                 bytes_read += bytes_to_read;
             }
         } else {
-            let handle = loop {
-                if let Some(b) = Arc::get_mut(&mut buffers[writing_buffer]) {
-                    break b;
-                }
-            };
 
             while bytes_read < length {
                 let bytes_to_read = usize::min(length - bytes_read, BUFFER_SIZE);
