@@ -5,17 +5,17 @@ use std::{
     io::{BufReader, Read},
 };
 
-const BUFFER_SIZE: usize = 1 * 1024;
-const DISTANCES: [u32; 30] = [
+const BUFFER_SIZE: usize = 2 * 1024;
+const DISTANCES: [u16; 30] = [
     1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
     2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
 ];
-const DISTANCE_EXTRA_BITS: [u32; 30] = [
+const DISTANCE_EXTRA_BITS: [u8; 30] = [
     0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
     13,
 ];
-const FIXED_DISTANCE_BIT_LENGTHS: [u32; 29] = [5; 29];
-const FIXED_LL_BIT_LENGTHS: [u32; 288] = [
+const FIXED_DISTANCE_BIT_LENGTHS: [u8; 29] = [5; 29];
+const FIXED_LL_BIT_LENGTHS: [u8; 288] = [
     8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
     8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
     8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
@@ -29,54 +29,54 @@ const FIXED_LL_BIT_LENGTHS: [u32; 288] = [
 const IDAT: [u8; 4] = [73, 68, 65, 84];
 const IEND: [u8; 4] = [73, 69, 78, 68];
 const IHDR: [u8; 4] = [73, 72, 68, 82];
-const LENGTHS: [u32; 29] = [
+const LENGTHS: [u16; 29] = [
     3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
     163, 195, 227, 258,
 ];
-const LENGTH_EXTRA_BITS: [u32; 29] = [
+const LENGTH_EXTRA_BITS: [u8; 29] = [
     0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
 ];
 const MAGIC_NUMBER: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
 const NUM_8BIT_CRCS: usize = 256;
 
 struct BitBuffer<'s> {
-    bits: u32,
-    bit_count: u32,
+    bits: u64,
+    bit_count: u8,
     index: usize,
     length: usize,
     stream: &'s [u8],
 }
 
 impl<'s> BitBuffer<'s> {
-    fn bits<'b>(&'b mut self, count: u32) -> u32 {
+    fn bits<'b>(&'b mut self, count: u8) -> u16 {
         if self.bit_count < count {
-            let repeat = usize::min((32 - self.bit_count as usize) / 8, self.length - self.index);
+            let repeat = usize::min((64 - self.bit_count as usize) / 8, self.length - self.index);
             for _ in 0..repeat {
-                self.bits |= (self.stream[self.index] as u32) << self.bit_count;
+                self.bits |= (self.stream[self.index] as u64) << self.bit_count;
                 self.bit_count += 8;
                 self.index += 1;
             }
         }
 
-        let value = self.bits & ((1u32 << count) - 1);
+        let value = self.bits & ((1u64 << count) - 1);
         self.bits >>= count;
         self.bit_count -= count;
 
-        return value;
+        return value as u16;
     }
 }
 
 struct HuffmanCode {
-    codes: Vec<u32>,
-    map: Vec<Vec<u32>>,
+    codes: Vec<u16>,
+    map: Vec<Vec<u16>>,
 }
 
 impl HuffmanCode {
-    fn decode<'b, 's>(&'b self, bit_buffer: &'b mut BitBuffer<'s>) -> Option<&u32> {
+    fn decode<'b, 's>(&'b self, bit_buffer: &'b mut BitBuffer<'s>) -> Option<&u16> {
         let mut code = 0;
         for bit in 0..self.codes.len() {
             code = (code << 1) | bit_buffer.bits(1);
-            match self.map[bit].get((code - self.codes[bit]) as usize) {
+            match self.map.get(bit)?.get((code - self.codes.get(bit)?) as usize) {
                 None => (),
                 value => return value,
             }
@@ -86,7 +86,7 @@ impl HuffmanCode {
     }
 
     // code_bit_lengths must appear lexicographic order of the alphabet
-    fn new<'n>(code_bit_lengths: &'n [u32], max_bit_length: usize) -> Self {
+    fn new<'n>(code_bit_lengths: &'n [u8], max_bit_length: usize) -> Self {
         let mut counts = vec![0; max_bit_length];
         let mut map = vec![Vec::new(); max_bit_length];
 
@@ -94,7 +94,7 @@ impl HuffmanCode {
             let bit_length = bit_length as usize;
             if 0 < bit_length {
                 counts[bit_length - 1] += 1;
-                map[bit_length - 1].push(i as u32);
+                map[bit_length - 1].push(i as u16);
             }
         }
 
@@ -105,17 +105,14 @@ impl HuffmanCode {
             codes[bit] = start;
         }
 
-        return Self {
-            codes,
-            map,
-        };
+        return Self { codes, map };
     }
 }
 
 pub struct Image {
     pub width: u32,
     pub height: u32,
-    pub num_channels: u8,
+    pub num_channels: u32,
     pub data: Vec<u8>,
 }
 
@@ -157,15 +154,30 @@ fn decode_block<'b, 's>(
 }
 
 fn dynamic<'b, 's>(bit_buffer: &'b mut BitBuffer<'s>, decoded_stream: &'b mut Vec<u8>) {
-    let hlit = bit_buffer.bits(5) as usize + 257;
-    let hdist = bit_buffer.bits(5) as usize + 1;
-    let hclen = bit_buffer.bits(4) as usize + 4;
+    let header = bit_buffer.bits(14) as usize;
+    let hlit = (header & 0x1F) + 257;
+    let hdist = ((header >> 5) & 0x1F) + 1;
+    let hclen = (header >> 10) + 4;
 
     let code_indices: [_; 19] = [
         16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
     ];
     let mut cc_bit_lengths = [0; 19];
-    (0..hclen).for_each(|i| cc_bit_lengths[code_indices[i]] = bit_buffer.bits(3));
+    for i in 0..hclen {
+        // None case cannot happen, as-per the specification. Hence, we do not want to panic here
+        // under any circumstance.
+        // TODO: Convert this to an error
+        let index = match code_indices.get(i) {
+            Some(&idx) => idx,
+            None => 0,
+        };
+
+        // None case cannot happen, by construction. We avoid panicking here.
+        match cc_bit_lengths.get_mut(index) {
+            Some(val) => *val = bit_buffer.bits(3) as u8,
+            None => (),
+        }
+    }
 
     let cc = HuffmanCode::new(&cc_bit_lengths, 7);
     let mut code_lengths = vec![0; hlit + hdist];
@@ -174,14 +186,18 @@ fn dynamic<'b, 's>(bit_buffer: &'b mut BitBuffer<'s>, decoded_stream: &'b mut Ve
 
     while num_decoded < code_lengths.capacity() {
         let (repeat, code_to_repeat) = match cc.decode(bit_buffer) {
-            Some(x @ 0..=15) => (1, *x),
+            Some(&x @ 0..=15) => (1, x as u8),
             Some(16) => (3 + bit_buffer.bits(2), last_code),
             Some(17) => (3 + bit_buffer.bits(3), 0),
             Some(18) => (11 + bit_buffer.bits(7), 0),
             _ => panic!("Dynamic Huffman: Unknown code for code lengths encountered"),
         };
 
-        for _ in 0..repeat {
+        // Need to repeat at-least once
+        code_lengths[num_decoded] = code_to_repeat;
+        num_decoded += 1;
+
+        for _ in 1..repeat {
             code_lengths[num_decoded] = code_to_repeat;
             num_decoded += 1;
         }
@@ -256,16 +272,14 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
     let mut zlib_stream = Vec::new();
     let mut chunk_type = IHDR;
     while chunk_type != IEND {
-        reader.read_exact(&mut buffer[..4])?;
+        reader.read_exact(&mut buffer[..8])?;
         let length = u32::from_be_bytes(buffer[..4].try_into()?) as usize;
+        chunk_type.copy_from_slice(&buffer[4..8]);
+        let mut crc = update_crc(0xFFFFFFFF, &buffer[4..8], &crc_table);
 
-        reader.read_exact(&mut buffer[..4])?;
-        chunk_type.copy_from_slice(&buffer[..4]);
-        let mut crc = update_crc(0xFFFFFFFF, &buffer[..4], &crc_table);
-
-        let mut bytes_read = 0;
         if chunk_type == IDAT {
             zlib_stream.reserve(length);
+            let mut bytes_read = 0;
             while bytes_read < length {
                 let bytes_to_read = usize::min(length - bytes_read, BUFFER_SIZE);
                 reader.read_exact(&mut buffer[..bytes_to_read])?;
@@ -274,6 +288,7 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
                 bytes_read += bytes_to_read;
             }
         } else {
+            let mut bytes_read = 0;
             while bytes_read < length {
                 let bytes_to_read = usize::min(length - bytes_read, BUFFER_SIZE);
                 reader.read_exact(&mut buffer[..bytes_to_read])?;
@@ -298,17 +313,12 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
     };
 
     let inflated_stream = inflate(&zlib_stream[2..], width, height, bytes_per_pixel);
-    let image_data = reconstruct(
-        inflated_stream,
-        width as usize,
-        height as usize,
-        bytes_per_pixel as usize,
-    );
+    let image_data = reconstruct(&inflated_stream, width, height, bytes_per_pixel);
 
     return Ok(Image {
         width: width as u32,
         height: height as u32,
-        num_channels: bytes_per_pixel as u8,
+        num_channels: bytes_per_pixel as u32,
         data: image_data,
     });
 }
@@ -317,8 +327,8 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
 pub extern "C" fn helium_c(
     #[cfg(windows)] file_name: *const u16,
     #[cfg(unix)] file_name: *const u8,
-    width: *mut i32,
-    height: *mut i32,
+    width: *mut u32,
+    height: *mut u32,
     num_channels: *mut i32,
     data: *mut *mut u8,
 ) -> i32 {
@@ -346,10 +356,10 @@ pub extern "C" fn helium_c(
         Some(file_name) => match helium(file_name) {
             Ok(i) => unsafe {
                 if !width.is_null() {
-                    *width = i.width as i32;
+                    *width = i.width;
                 }
                 if !height.is_null() {
-                    *height = i.height as i32;
+                    *height = i.height;
                 }
                 if !num_channels.is_null() {
                     *num_channels = i.num_channels as i32;
@@ -390,8 +400,8 @@ fn inflate(zlib_stream: &[u8], width: usize, height: usize, bytes_per_pixel: usi
                 bit_buffer.bits >>= 5;
                 bit_buffer.bit_count -= 5;
 
-                let length = bit_buffer.bits(16) as u16;
-                let ones_complement = bit_buffer.bits(16) as u16;
+                let length = bit_buffer.bits(16);
+                let ones_complement = bit_buffer.bits(16);
                 assert_eq!(length ^ 0xFFFF, ones_complement);
 
                 (0..length).for_each(|_| decoded_stream.push(bit_buffer.bits(8) as u8));
@@ -419,53 +429,54 @@ fn inflate(zlib_stream: &[u8], width: usize, height: usize, bytes_per_pixel: usi
     return decoded_stream;
 }
 
+fn paeth(a: u8, b: u8, c: u8) -> u8 {
+    let a16 = a as i16;
+    let b16 = b as i16;
+    let c16 = c as i16;
+
+    let p = a16 + b16 - c16;
+    let pa = i16::abs(p - a16);
+    let pb = i16::abs(p - b16);
+    let pc = i16::abs(p - c16);
+
+    if (pa <= pb) && (pa <= pc) {
+        a
+    } else if pb <= pc {
+        b
+    } else {
+        c
+    }
+}
+
 fn reconstruct(
-    inflated_stream: Vec<u8>,
+    inflated_stream: &[u8],
     width: usize,
     height: usize,
     bytes_per_pixel: usize,
 ) -> Vec<u8> {
+    let bppo = bytes_per_pixel + 1;
     let scanline_width = bytes_per_pixel * width;
     let mut unfiltered_stream = Vec::with_capacity(scanline_width * height);
     let filter_byte_index = scanline_width + 1;
 
-    fn paeth(a: u8, b: u8, c: u8) -> u8 {
-        let a16 = a as i16;
-        let b16 = b as i16;
-        let c16 = c as i16;
-
-        let p = a16 + b16 - c16;
-        let pa = i16::abs(p - a16);
-        let pb = i16::abs(p - b16);
-        let pc = i16::abs(p - c16);
-
-        if (pa <= pb) && (pa <= pc) {
-            a
-        } else if pb <= pc {
-            b
-        } else {
-            c
-        }
-    }
-
     match inflated_stream[0] {
         0 | 2 => unfiltered_stream.extend_from_slice(&inflated_stream[1..filter_byte_index]),
         1 => {
-            unfiltered_stream.extend_from_slice(&inflated_stream[1..(bytes_per_pixel + 1)]);
-            for byte in (bytes_per_pixel + 1)..filter_byte_index {
+            unfiltered_stream.extend_from_slice(&inflated_stream[1..bppo]);
+            for byte in bppo..filter_byte_index {
                 let x = inflated_stream[byte];
-                let a = unfiltered_stream[byte - bytes_per_pixel - 1];
+                let a = unfiltered_stream[byte - bppo];
                 let (value, _) = x.overflowing_add(a);
                 unfiltered_stream.push(value);
             }
         }
         3 => {
             // First pixel: We don't have pixel to the left and we don't have a pixel to the top.
-            unfiltered_stream.extend_from_slice(&inflated_stream[1..(bytes_per_pixel + 1)]);
+            unfiltered_stream.extend_from_slice(&inflated_stream[1..bppo]);
             // Rest: Only have a pixel to the left, not above.
-            for byte in (bytes_per_pixel + 1)..scanline_width {
-                let (value, _) = inflated_stream[byte]
-                    .overflowing_add(unfiltered_stream[byte - bytes_per_pixel - 1]);
+            for byte in bppo..scanline_width {
+                let (value, _) =
+                    inflated_stream[byte].overflowing_add(unfiltered_stream[byte - bppo]);
                 unfiltered_stream.push(value >> 1);
             }
         }
@@ -474,44 +485,46 @@ fn reconstruct(
     };
 
     for scanline in 1..height {
-        let scfbi = scanline * filter_byte_index;
-        match inflated_stream[scfbi] {
-            0 => unfiltered_stream
-                .extend_from_slice(&inflated_stream[(scfbi + 1)..(scfbi + filter_byte_index)]),
+        let filter_byte = scanline * filter_byte_index;
+        let first_byte = filter_byte + 1;
+        let unfiltered_cs = scanline * scanline_width;
+        let unfiltered_ps = (scanline - 1) * scanline_width;
+
+        match inflated_stream[filter_byte] {
+            0 => unfiltered_stream.extend_from_slice(
+                &inflated_stream[(filter_byte + 1)..(filter_byte + filter_byte_index)],
+            ),
             1 => {
-                let first = scfbi + 1;
-                unfiltered_stream
-                    .extend_from_slice(&inflated_stream[first..(first + bytes_per_pixel)]);
-                for byte in (bytes_per_pixel + 1)..filter_byte_index {
-                    let x = inflated_stream[scfbi + byte];
-                    let a =
-                        unfiltered_stream[scanline * scanline_width + byte - bytes_per_pixel - 1];
+                unfiltered_stream.extend_from_slice(
+                    &inflated_stream[first_byte..(first_byte + bytes_per_pixel)],
+                );
+                for byte in bppo..filter_byte_index {
+                    let x = inflated_stream[filter_byte + byte];
+                    let a = unfiltered_stream[unfiltered_cs + byte - bppo];
                     let (value, _) = x.overflowing_add(a);
                     unfiltered_stream.push(value);
                 }
             }
             2 => {
                 for byte in 0..scanline_width {
-                    let x = inflated_stream[scfbi + byte + 1];
-                    let b = unfiltered_stream[(scanline - 1) * scanline_width + byte];
+                    let x = inflated_stream[first_byte + byte];
+                    let b = unfiltered_stream[unfiltered_ps + byte];
                     let (value, _) = x.overflowing_add(b);
                     unfiltered_stream.push(value);
                 }
             }
             3 => {
                 for byte in 0..bytes_per_pixel {
-                    let x = inflated_stream[(scfbi + 1) + byte];
-                    let b = unfiltered_stream[(scanline - 1) * scanline_width + byte];
+                    let x = inflated_stream[first_byte + byte];
+                    let b = unfiltered_stream[unfiltered_ps + byte];
                     let (value, _) = x.overflowing_add(b >> 1);
                     unfiltered_stream.push(value);
                 }
 
-                for byte in (bytes_per_pixel + 1)..filter_byte_index {
-                    let x = inflated_stream[scfbi + byte];
-                    let b = unfiltered_stream[(scanline - 1) * scanline_width + byte - 1] as u16;
-                    let a = unfiltered_stream
-                        [scanline * scanline_width + byte - bytes_per_pixel - 1]
-                        as u16;
+                for byte in bppo..filter_byte_index {
+                    let x = inflated_stream[filter_byte + byte];
+                    let b = unfiltered_stream[unfiltered_ps + byte - 1] as u16;
+                    let a = unfiltered_stream[unfiltered_cs + byte - bppo] as u16;
 
                     let (value, _) = x.overflowing_add(((a + b) >> 1) as u8);
                     unfiltered_stream.push(value);
@@ -519,19 +532,17 @@ fn reconstruct(
             }
             4 => {
                 for byte in 0..bytes_per_pixel {
-                    let x = inflated_stream[scfbi + byte + 1];
-                    let b = unfiltered_stream[(scanline - 1) * scanline_width + byte];
+                    let x = inflated_stream[first_byte + byte];
+                    let b = unfiltered_stream[unfiltered_ps + byte];
                     let (value, _) = x.overflowing_add(paeth(0, b, 0));
                     unfiltered_stream.push(value);
                 }
 
-                for byte in (bytes_per_pixel + 1)..filter_byte_index {
-                    let x = inflated_stream[scfbi + byte];
-                    let c = unfiltered_stream
-                        [(scanline - 1) * scanline_width + byte - bytes_per_pixel - 1];
-                    let b = unfiltered_stream[(scanline - 1) * scanline_width + byte - 1];
-                    let a =
-                        unfiltered_stream[scanline * scanline_width + byte - bytes_per_pixel - 1];
+                for byte in bppo..filter_byte_index {
+                    let x = inflated_stream[filter_byte + byte];
+                    let c = unfiltered_stream[unfiltered_ps + byte - bppo];
+                    let b = unfiltered_stream[unfiltered_ps + byte - 1];
+                    let a = unfiltered_stream[unfiltered_cs + byte - bppo];
 
                     let (value, _) = x.overflowing_add(paeth(a, b, c));
                     unfiltered_stream.push(value);
