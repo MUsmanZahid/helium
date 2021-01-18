@@ -1,6 +1,7 @@
 use std::{
     convert::TryInto,
     error::Error,
+    fmt::{self, Display, Formatter},
     fs::File,
     io::{BufReader, Read},
 };
@@ -48,11 +49,14 @@ struct BitBuffer<'s> {
 }
 
 impl<'s> BitBuffer<'s> {
-    fn bits<'b>(&'b mut self, count: u8) -> u16 {
+    fn bits<'b>(&'b mut self, count: u8) -> Result<u16, ZlibError> {
         if self.bit_count < count {
             let repeat = usize::min((64 - self.bit_count as usize) / 8, self.length - self.index);
             for _ in 0..repeat {
-                self.bits |= (self.stream[self.index] as u64) << self.bit_count;
+                match self.stream.get(self.index) {
+                    Some(&i) => self.bits |= (i as u64) << self.bit_count,
+                    None => return dbg!(Err(ZlibError::StreamOverflow)),
+                }
                 self.bit_count += 8;
                 self.index += 1;
             }
@@ -62,7 +66,7 @@ impl<'s> BitBuffer<'s> {
         self.bits >>= count;
         self.bit_count -= count;
 
-        return value as u16;
+        return Ok(value as u16);
     }
 }
 
@@ -72,17 +76,23 @@ struct HuffmanCode {
 }
 
 impl HuffmanCode {
-    fn decode<'b, 's>(&'b self, bit_buffer: &'b mut BitBuffer<'s>) -> Option<&u16> {
+    fn decode<'b, 's>(&'b self, bit_buffer: &'b mut BitBuffer<'s>) -> Result<u16, ZlibError> {
         let mut code = 0;
         for bit in 0..self.codes.len() {
-            code = (code << 1) | bit_buffer.bits(1);
-            match self.map.get(bit)?.get((code - self.codes.get(bit)?) as usize) {
-                None => (),
-                value => return value,
+            code = (code << 1) | bit_buffer.bits(1)?;
+            match self.map.get(bit) {
+                Some(i) => match self.codes.get(bit) {
+                    Some(start) => match i.get((code - start) as usize) {
+                        Some(&value) => return Ok(value),
+                        None => (), // Continue searching
+                    },
+                    None => return Err(ZlibError::InvalidBitLength),
+                },
+                _ => return Err(ZlibError::InvalidBitLength),
             }
         }
 
-        return None;
+        return Err(ZlibError::InvalidHuffmanCode);
     }
 
     // code_bit_lengths must appear lexicographic order of the alphabet
@@ -93,8 +103,14 @@ impl HuffmanCode {
         for (i, &bit_length) in code_bit_lengths.iter().enumerate() {
             let bit_length = bit_length as usize;
             if 0 < bit_length {
-                counts[bit_length - 1] += 1;
-                map[bit_length - 1].push(i as u16);
+                match counts.get_mut(bit_length - 1) {
+                    Some(count) => *count += 1,
+                    None => (), // Cannot happen by construction
+                }
+                match map.get_mut(bit_length - 1) {
+                    Some(v) => v.push(i as u16),
+                    None => (), // Cannot happen by construction
+                }
             }
         }
 
@@ -102,7 +118,10 @@ impl HuffmanCode {
         let mut start = 0;
         for bit in 1..(max_bit_length + 1) {
             start = (start + counts[bit - 1]) << 1;
-            codes[bit] = start;
+            match codes.get_mut(bit) {
+                Some(c) => *c = start,
+                None => (), // Cannot happen by construction
+            }
         }
 
         return Self { codes, map };
@@ -116,29 +135,50 @@ pub struct Image {
     pub data: Vec<u8>,
 }
 
+#[derive(Debug)]
+enum ZlibError {
+    InvalidBitLength,
+    InvalidCodeLength,
+    InvalidDistance,
+    InvalidHCLEN,
+    InvalidHuffmanCode,
+    InvalidLiteralLength,
+    PartialStreamInflation,
+    StreamOverflow,
+    UnknownBlockCompression,
+}
+
+impl Display for ZlibError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "")
+    }
+}
+
+impl Error for ZlibError {}
+
 fn decode_block<'b, 's>(
     bit_buffer: &'b mut BitBuffer<'s>,
     decoded_stream: &'b mut Vec<u8>,
     distance: &'b HuffmanCode,
     literal_length: &'b HuffmanCode,
-) {
+) -> Result<(), ZlibError> {
     loop {
-        match literal_length.decode(bit_buffer) {
-            Some(x @ 0..=255) => decoded_stream.push(*x as u8),
-            Some(256) => break,
-            Some(x @ 257..=285) => {
-                let length_index = *x as usize - 257;
+        match literal_length.decode(bit_buffer)? {
+            x @ 0..=255 => decoded_stream.push(x as u8),
+            256 => break Ok(()),
+            x @ 257..=285 => {
+                let length_index = x as usize - 257;
                 let extra_bits = LENGTH_EXTRA_BITS[length_index];
-                let extra_length = bit_buffer.bits(extra_bits);
+                let extra_length = bit_buffer.bits(extra_bits)?;
                 let length = LENGTHS[length_index] + extra_length;
 
                 // Get distance code
                 let distance_index = match distance.decode(bit_buffer) {
-                    Some(x @ 0..=29) => *x as usize,
-                    _ => panic!("Invalid distance code!"),
+                    Ok(x @ 0..=29) => x as usize,
+                    _ => break Err(ZlibError::InvalidDistance),
                 };
                 let extra_bits = DISTANCE_EXTRA_BITS[distance_index];
-                let extra_distance = bit_buffer.bits(extra_bits);
+                let extra_distance = bit_buffer.bits(extra_bits)?;
                 let distance = DISTANCES[distance_index] + extra_distance;
 
                 let current_length = decoded_stream.len();
@@ -148,13 +188,16 @@ fn decode_block<'b, 's>(
                     decoded_stream.push(value);
                 }
             }
-            _ => panic!("Invalid literal/length code!"),
+            _ => break Err(ZlibError::InvalidLiteralLength),
         }
     }
 }
 
-fn dynamic<'b, 's>(bit_buffer: &'b mut BitBuffer<'s>, decoded_stream: &'b mut Vec<u8>) {
-    let header = bit_buffer.bits(14) as usize;
+fn dynamic<'b, 's>(
+    bit_buffer: &'b mut BitBuffer<'s>,
+    decoded_stream: &'b mut Vec<u8>,
+) -> Result<(), ZlibError> {
+    let header = bit_buffer.bits(14)? as usize;
     let hlit = (header & 0x1F) + 257;
     let hdist = ((header >> 5) & 0x1F) + 1;
     let hclen = (header >> 10) + 4;
@@ -166,15 +209,14 @@ fn dynamic<'b, 's>(bit_buffer: &'b mut BitBuffer<'s>, decoded_stream: &'b mut Ve
     for i in 0..hclen {
         // None case cannot happen, as-per the specification. Hence, we do not want to panic here
         // under any circumstance.
-        // TODO: Convert this to an error
         let index = match code_indices.get(i) {
             Some(&idx) => idx,
-            None => 0,
+            None => return Err(ZlibError::InvalidHCLEN),
         };
 
         // None case cannot happen, by construction. We avoid panicking here.
         match cc_bit_lengths.get_mut(index) {
-            Some(val) => *val = bit_buffer.bits(3) as u8,
+            Some(val) => *val = bit_buffer.bits(3)? as u8,
             None => (),
         }
     }
@@ -185,12 +227,12 @@ fn dynamic<'b, 's>(bit_buffer: &'b mut BitBuffer<'s>, decoded_stream: &'b mut Ve
     let mut last_code = 0;
 
     while num_decoded < code_lengths.capacity() {
-        let (repeat, code_to_repeat) = match cc.decode(bit_buffer) {
-            Some(&x @ 0..=15) => (1, x as u8),
-            Some(16) => (3 + bit_buffer.bits(2), last_code),
-            Some(17) => (3 + bit_buffer.bits(3), 0),
-            Some(18) => (11 + bit_buffer.bits(7), 0),
-            _ => panic!("Dynamic Huffman: Unknown code for code lengths encountered"),
+        let (repeat, code_to_repeat) = match cc.decode(bit_buffer)? {
+            x @ 0..=15 => (1, x as u8),
+            16 => (3 + bit_buffer.bits(2)?, last_code),
+            17 => (3 + bit_buffer.bits(3)?, 0),
+            18 => (11 + bit_buffer.bits(7)?, 0),
+            _ => return Err(ZlibError::InvalidCodeLength),
         };
 
         // Need to repeat at-least once
@@ -212,7 +254,7 @@ fn dynamic<'b, 's>(bit_buffer: &'b mut BitBuffer<'s>, decoded_stream: &'b mut Ve
 
     let literal_length = HuffmanCode::new(&ll_bit_lengths, 15);
     let distance = HuffmanCode::new(&distance_bit_lengths, 15);
-    decode_block(bit_buffer, decoded_stream, &distance, &literal_length);
+    return decode_block(bit_buffer, decoded_stream, &distance, &literal_length);
 }
 
 pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
@@ -312,8 +354,8 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
         _ => panic!("Invalid colour type"),
     };
 
-    let inflated_stream = inflate(&zlib_stream[2..], width, height, bytes_per_pixel);
-    let image_data = reconstruct(&inflated_stream, width, height, bytes_per_pixel);
+    let inflated_stream = inflate(&zlib_stream[2..], width, height, bytes_per_pixel)?;
+    let image_data = reconstruct(&inflated_stream, width, height, bytes_per_pixel)?;
 
     return Ok(Image {
         width: width as u32,
@@ -376,7 +418,12 @@ pub extern "C" fn helium_c(
     return 0;
 }
 
-fn inflate(zlib_stream: &[u8], width: usize, height: usize, bytes_per_pixel: usize) -> Vec<u8> {
+fn inflate(
+    zlib_stream: &[u8],
+    width: usize,
+    height: usize,
+    bytes_per_pixel: usize,
+) -> Result<Vec<u8>, ZlibError> {
     let mut bit_buffer = BitBuffer {
         bits: 0,
         bit_count: 0,
@@ -386,34 +433,38 @@ fn inflate(zlib_stream: &[u8], width: usize, height: usize, bytes_per_pixel: usi
     };
 
     // Allocate: Total number of pixels + additional filter bytes for each scanline
-    let mut decoded_stream = Vec::with_capacity((bytes_per_pixel * width + 1) * height);
+    let num_bytes = (bytes_per_pixel * width + 1) * height;
+    let mut decoded_stream = Vec::with_capacity(num_bytes);
 
     // Pre-construct fixed Huffman codes
     let fixed_literal_length = HuffmanCode::new(&FIXED_LL_BIT_LENGTHS, 9);
     let fixed_distance = HuffmanCode::new(&FIXED_DISTANCE_BIT_LENGTHS, 5);
 
     loop {
-        let last_block = bit_buffer.bits(1) == 1;
-        match bit_buffer.bits(2) {
+        let last_block = bit_buffer.bits(1)? == 1;
+        match bit_buffer.bits(2)? {
             0 => {
                 // Raw literal block
                 bit_buffer.bits >>= 5;
                 bit_buffer.bit_count -= 5;
 
-                let length = bit_buffer.bits(16);
-                let ones_complement = bit_buffer.bits(16);
+                let length = bit_buffer.bits(16)?;
+                let ones_complement = bit_buffer.bits(16)?;
                 assert_eq!(length ^ 0xFFFF, ones_complement);
 
-                (0..length).for_each(|_| decoded_stream.push(bit_buffer.bits(8) as u8));
+                for _ in 0..length {
+                    let value = bit_buffer.bits(8)? as u8;
+                    decoded_stream.push(value);
+                }
             }
             1 => decode_block(
                 &mut bit_buffer,
                 &mut decoded_stream,
                 &fixed_distance,
                 &fixed_literal_length,
-            ),
-            2 => dynamic(&mut bit_buffer, &mut decoded_stream),
-            _ => panic!("Unknown Huffman compression format!"),
+            )?,
+            2 => dynamic(&mut bit_buffer, &mut decoded_stream)?,
+            _ => return Err(ZlibError::UnknownBlockCompression),
         }
 
         if last_block {
@@ -421,12 +472,11 @@ fn inflate(zlib_stream: &[u8], width: usize, height: usize, bytes_per_pixel: usi
         }
     }
 
-    assert_eq!(
-        decoded_stream.len(),
-        decoded_stream.capacity(),
-        "Did not decode the full image"
-    );
-    return decoded_stream;
+    if decoded_stream.len() != num_bytes {
+        return Err(ZlibError::PartialStreamInflation);
+    } else {
+        return Ok(decoded_stream);
+    }
 }
 
 fn paeth(a: u8, b: u8, c: u8) -> u8 {
@@ -448,12 +498,26 @@ fn paeth(a: u8, b: u8, c: u8) -> u8 {
     }
 }
 
+#[derive(Debug)]
+enum PngError {
+    PartialReconstruction,
+    UnknownFilterType,
+}
+
+impl Display for PngError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "")
+    }
+}
+
+impl Error for PngError {}
+
 fn reconstruct(
     inflated_stream: &[u8],
     width: usize,
     height: usize,
     bytes_per_pixel: usize,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, PngError> {
     let bppo = bytes_per_pixel + 1;
     let scanline_width = bytes_per_pixel * width;
     let mut unfiltered_stream = Vec::with_capacity(scanline_width * height);
@@ -481,7 +545,7 @@ fn reconstruct(
             }
         }
         4 => todo!("Paeth"),
-        _ => panic!("Unknown filter type!"),
+        _ => return Err(PngError::UnknownFilterType),
     };
 
     for scanline in 1..height {
@@ -548,12 +612,15 @@ fn reconstruct(
                     unfiltered_stream.push(value);
                 }
             }
-            _ => panic!("Unknown filter type!"),
+            _ => return Err(PngError::UnknownFilterType),
         }
     }
 
-    assert_eq!(unfiltered_stream.len(), scanline_width * height);
-    return unfiltered_stream;
+    if unfiltered_stream.len() != (scanline_width * height) {
+        return Err(PngError::PartialReconstruction);
+    } else {
+        return Ok(unfiltered_stream);
+    }
 }
 
 fn update_crc(mut crc: u32, buffer: &[u8], crc_table: &[u32; 256]) -> u32 {
