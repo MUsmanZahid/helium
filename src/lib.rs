@@ -55,7 +55,7 @@ impl<'s> BitBuffer<'s> {
             for _ in 0..repeat {
                 match self.stream.get(self.index) {
                     Some(&i) => self.bits |= (i as u64) << self.bit_count,
-                    None => return dbg!(Err(ZlibError::StreamOverflow)),
+                    None => return Err(ZlibError::StreamOverflow),
                 }
                 self.bit_count += 8;
                 self.index += 1;
@@ -80,15 +80,10 @@ impl HuffmanCode {
         let mut code = 0;
         for bit in 0..self.codes.len() {
             code = (code << 1) | bit_buffer.bits(1)?;
-            match self.map.get(bit) {
-                Some(i) => match self.codes.get(bit) {
-                    Some(start) => match i.get((code - start) as usize) {
-                        Some(&value) => return Ok(value),
-                        None => (), // Continue searching
-                    },
-                    None => return Err(ZlibError::InvalidBitLength),
-                },
-                _ => return Err(ZlibError::InvalidBitLength),
+            let start = self.codes.get(bit).ok_or(ZlibError::InvalidBitLength)?;
+            let bit_codes = self.map.get(bit).ok_or(ZlibError::InvalidBitLength)?;
+            if let Some(&value) = bit_codes.get((code - start) as usize) {
+                return Ok(value);
             }
         }
 
@@ -103,13 +98,11 @@ impl HuffmanCode {
         for (i, &bit_length) in code_bit_lengths.iter().enumerate() {
             let bit_length = bit_length as usize;
             if 0 < bit_length {
-                match counts.get_mut(bit_length - 1) {
-                    Some(count) => *count += 1,
-                    None => (), // Cannot happen by construction
+                if let Some(count) = counts.get_mut(bit_length - 1) {
+                    *count += 1;
                 }
-                match map.get_mut(bit_length - 1) {
-                    Some(v) => v.push(i as u16),
-                    None => (), // Cannot happen by construction
+                if let Some(v) = map.get_mut(bit_length - 1) {
+                    v.push(i as u16);
                 }
             }
         }
@@ -118,9 +111,8 @@ impl HuffmanCode {
         let mut start = 0;
         for bit in 1..(max_bit_length + 1) {
             start = (start + counts[bit - 1]) << 1;
-            match codes.get_mut(bit) {
-                Some(c) => *c = start,
-                None => (), // Cannot happen by construction
+            if let Some(c) = codes.get_mut(bit) {
+                *c = start;
             }
         }
 
@@ -207,17 +199,12 @@ fn dynamic<'b, 's>(
     ];
     let mut cc_bit_lengths = [0; 19];
     for i in 0..hclen {
-        // None case cannot happen, as-per the specification. Hence, we do not want to panic here
-        // under any circumstance.
-        let index = match code_indices.get(i) {
-            Some(&idx) => idx,
-            None => return Err(ZlibError::InvalidHCLEN),
-        };
-
+        // None case can only happen due to PNG corruption as we've made the `code_indices` array
+        // the size of the maximum possible elements allowable by the standard.
+        let index = code_indices.get(i).ok_or(ZlibError::InvalidHCLEN)?;
         // None case cannot happen, by construction. We avoid panicking here.
-        match cc_bit_lengths.get_mut(index) {
-            Some(val) => *val = bit_buffer.bits(3)? as u8,
-            None => (),
+        if let Some(value) =  cc_bit_lengths.get_mut(*index as usize) {
+            *value = bit_buffer.bits(3)? as u8;
         }
     }
 
@@ -257,6 +244,28 @@ fn dynamic<'b, 's>(
     return decode_block(bit_buffer, decoded_stream, &distance, &literal_length);
 }
 
+#[derive(Debug)]
+enum PngError {
+    InvalidChunkCRC(u32, u32),
+    InvalidHeaderLength,
+    InvalidMagicNumber([u8; 4]),
+    MissingHeaderChunk,
+    NonZeroCompressionMethod,
+    NonZeroFilterMethod,
+    PartialOrOverReconstruction,
+    UnknownFilterType,
+    UnsupportedBitDepth(u8),
+    UnsupportedInterlaceMethod,
+}
+
+impl Display for PngError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "")
+    }
+}
+
+impl Error for PngError {}
+
 pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
     let file = File::open(file_name)?;
     let mut reader = BufReader::new(file);
@@ -280,18 +289,29 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
         table
     };
 
+    // First 8-bytes of a PNG file are its identifying magic number
     reader.read_exact(&mut buffer[..8])?;
-    assert_eq!(buffer[..8], MAGIC_NUMBER);
+    if buffer[..8] != MAGIC_NUMBER {
+        Err(PngError::InvalidMagicNumber(buffer[..8].try_into()?))?
+    }
 
-    // IHDR
+    // Read the image header - the IHDR chunk.
     reader.read_exact(&mut buffer[..4])?;
     let length = u32::from_be_bytes(buffer[..4].try_into()?);
-    assert_eq!(length, 13);
+    // The length of the IHDR chunk is set to be 13-bytes by the specification
+    if length != 13 {
+        Err(PngError::InvalidHeaderLength)?
+    }
 
+    // Read the IHDR chunk name - literally four bytes: 'I' 'H' 'D' 'R' - and its associated data
     let data_length = 4 + length as usize;
     reader.read_exact(&mut buffer[..data_length])?;
-    assert_eq!(buffer[..4], IHDR);
+    // Make sure we are reading the right chunk as this determines the entire structure of the file
+    if buffer[..4] != IHDR {
+        Err(PngError::MissingHeaderChunk)?
+    }
 
+    // The fields of the IHDR chunk are ordered as retrieved below
     let width = u32::from_be_bytes(buffer[4..8].try_into()?) as usize;
     let height = u32::from_be_bytes(buffer[8..12].try_into()?) as usize;
     let bit_depth = buffer[12];
@@ -300,15 +320,25 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
     let filter_method = buffer[15];
     let interlace_method = buffer[16];
 
-    assert_eq!(bit_depth, 8);
-    assert_eq!(compression_method, 0);
-    assert_eq!(filter_method, 0);
-    assert_eq!(interlace_method, 0);
+    // The interlace method can be 0 or 1. We only support non-interlaced images for now. The filter
+    // and compression methods must both be zero. Finally, we only support images with bit-depths of
+    // 8 bytes-per-pixel.
+    if interlace_method != 0 {
+        Err(PngError::UnsupportedInterlaceMethod)?
+    } else if filter_method != 0 {
+        Err(PngError::NonZeroFilterMethod)?
+    } else if compression_method != 0 {
+        Err(PngError::NonZeroCompressionMethod)?
+    } else if bit_depth != 0 {
+        Err(PngError::UnsupportedBitDepth(bit_depth))?
+    }
 
     let crc = update_crc(0xFFFFFFFF, &buffer[..data_length], &crc_table) ^ 0xFFFFFFFF;
     reader.read_exact(&mut buffer[..4])?;
     let file_crc = u32::from_be_bytes(buffer[..4].try_into()?);
-    assert_eq!(file_crc, crc);
+    if file_crc != crc {
+        Err(PngError::InvalidChunkCRC(file_crc, crc))?
+    }
 
     // Collect zlib stream
     let mut zlib_stream = Vec::new();
@@ -342,7 +372,9 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
         crc ^= 0xFFFFFFFF;
         reader.read_exact(&mut buffer[..4])?;
         let file_crc = u32::from_be_bytes(buffer[..4].try_into()?);
-        assert_eq!(crc, file_crc);
+        if file_crc != crc {
+            Err(PngError::InvalidChunkCRC(file_crc, crc))?
+        }
     }
 
     let bytes_per_pixel = match colour_type {
@@ -445,9 +477,14 @@ fn inflate(
         match bit_buffer.bits(2)? {
             0 => {
                 // Raw literal block
+                // Clear the rest of the bits in the buffer. They are useless.
                 bit_buffer.bits >>= 5;
                 bit_buffer.bit_count -= 5;
 
+                // Block is defined by two bytes:
+                // 1. Length of the block
+                // 2. One's complement of the length - for safety.
+                // 3. Length bytes of raw pixel data
                 let length = bit_buffer.bits(16)?;
                 let ones_complement = bit_buffer.bits(16)?;
                 assert_eq!(length ^ 0xFFFF, ones_complement);
@@ -497,20 +534,6 @@ fn paeth(a: u8, b: u8, c: u8) -> u8 {
         c
     }
 }
-
-#[derive(Debug)]
-enum PngError {
-    PartialReconstruction,
-    UnknownFilterType,
-}
-
-impl Display for PngError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "")
-    }
-}
-
-impl Error for PngError {}
 
 fn reconstruct(
     inflated_stream: &[u8],
@@ -617,7 +640,7 @@ fn reconstruct(
     }
 
     if unfiltered_stream.len() != (scanline_width * height) {
-        return Err(PngError::PartialReconstruction);
+        return Err(PngError::PartialOrOverReconstruction);
     } else {
         return Ok(unfiltered_stream);
     }
