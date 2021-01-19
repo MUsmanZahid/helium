@@ -4,6 +4,8 @@ use std::{
     fmt::{self, Display, Formatter},
     fs::File,
     io::{BufReader, Read},
+    mem::ManuallyDrop,
+    slice,
 };
 
 const BUFFER_SIZE: usize = 2 * 1024;
@@ -203,7 +205,7 @@ fn dynamic<'b, 's>(
         // the size of the maximum possible elements allowable by the standard.
         let index = code_indices.get(i).ok_or(ZlibError::InvalidHCLEN)?;
         // None case cannot happen, by construction. We avoid panicking here.
-        if let Some(value) =  cc_bit_lengths.get_mut(*index as usize) {
+        if let Some(value) = cc_bit_lengths.get_mut(*index as usize) {
             *value = bit_buffer.bits(3)? as u8;
         }
     }
@@ -246,9 +248,10 @@ fn dynamic<'b, 's>(
 
 #[derive(Debug)]
 enum PngError {
+    InvalidColourType,
     InvalidChunkCRC(u32, u32),
     InvalidHeaderLength,
-    InvalidMagicNumber([u8; 4]),
+    InvalidMagicNumber([u8; 8]),
     MissingHeaderChunk,
     NonZeroCompressionMethod,
     NonZeroFilterMethod,
@@ -292,53 +295,9 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
     // First 8-bytes of a PNG file are its identifying magic number
     reader.read_exact(&mut buffer[..8])?;
     if buffer[..8] != MAGIC_NUMBER {
-        Err(PngError::InvalidMagicNumber(buffer[..8].try_into()?))?
+        return Err(Box::new(PngError::InvalidMagicNumber(buffer[..8].try_into()?)));
     }
-
-    // Read the image header - the IHDR chunk.
-    reader.read_exact(&mut buffer[..4])?;
-    let length = u32::from_be_bytes(buffer[..4].try_into()?);
-    // The length of the IHDR chunk is set to be 13-bytes by the specification
-    if length != 13 {
-        Err(PngError::InvalidHeaderLength)?
-    }
-
-    // Read the IHDR chunk name - literally four bytes: 'I' 'H' 'D' 'R' - and its associated data
-    let data_length = 4 + length as usize;
-    reader.read_exact(&mut buffer[..data_length])?;
-    // Make sure we are reading the right chunk as this determines the entire structure of the file
-    if buffer[..4] != IHDR {
-        Err(PngError::MissingHeaderChunk)?
-    }
-
-    // The fields of the IHDR chunk are ordered as retrieved below
-    let width = u32::from_be_bytes(buffer[4..8].try_into()?) as usize;
-    let height = u32::from_be_bytes(buffer[8..12].try_into()?) as usize;
-    let bit_depth = buffer[12];
-    let colour_type = buffer[13];
-    let compression_method = buffer[14];
-    let filter_method = buffer[15];
-    let interlace_method = buffer[16];
-
-    // The interlace method can be 0 or 1. We only support non-interlaced images for now. The filter
-    // and compression methods must both be zero. Finally, we only support images with bit-depths of
-    // 8 bytes-per-pixel.
-    if interlace_method != 0 {
-        Err(PngError::UnsupportedInterlaceMethod)?
-    } else if filter_method != 0 {
-        Err(PngError::NonZeroFilterMethod)?
-    } else if compression_method != 0 {
-        Err(PngError::NonZeroCompressionMethod)?
-    } else if bit_depth != 8 {
-        Err(PngError::UnsupportedBitDepth(bit_depth))?
-    }
-
-    let crc = update_crc(0xFFFFFFFF, &buffer[..data_length], &crc_table) ^ 0xFFFFFFFF;
-    reader.read_exact(&mut buffer[..4])?;
-    let file_crc = u32::from_be_bytes(buffer[..4].try_into()?);
-    if file_crc != crc {
-        Err(PngError::InvalidChunkCRC(file_crc, crc))?
-    }
+    let header = parse_header(&mut buffer, &crc_table, &mut reader)?;
 
     // Collect zlib stream
     let mut zlib_stream = Vec::new();
@@ -373,26 +332,16 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
         reader.read_exact(&mut buffer[..4])?;
         let file_crc = u32::from_be_bytes(buffer[..4].try_into()?);
         if file_crc != crc {
-            Err(PngError::InvalidChunkCRC(file_crc, crc))?
+            return Err(Box::new(PngError::InvalidChunkCRC(file_crc, crc)));
         }
     }
 
-    let bytes_per_pixel = match colour_type {
-        0 => todo!(),
-        2 => 3,
-        3 => todo!(),
-        4 => todo!(),
-        6 => 4,
-        _ => panic!("Invalid colour type"),
-    };
-
-    let inflated_stream = inflate(&zlib_stream[2..], width, height, bytes_per_pixel)?;
-    let image_data = reconstruct(&inflated_stream, width, height, bytes_per_pixel)?;
-
+    let inflated_stream = inflate(&zlib_stream[2..], &header)?;
+    let image_data = reconstruct(&inflated_stream, &header)?;
     return Ok(Image {
-        width: width as u32,
-        height: height as u32,
-        num_channels: bytes_per_pixel as u32,
+        width: header.width as u32,
+        height: header.height as u32,
+        num_channels: header.bytes_per_pixel as u32,
         data: image_data,
     });
 }
@@ -412,11 +361,11 @@ pub extern "C" fn helium_c(
 
     let name = unsafe {
         let length = (0..).take_while(|&i| *file_name.offset(i) != 0).count();
-        let slice = std::slice::from_raw_parts(file_name, length);
+        let slice = ManuallyDrop::new(slice::from_raw_parts(file_name, length));
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
-            std::ffi::OsStr::from_bytes(slice)
+            std::ffi::OsStr::from_bytes(*slice)
         }
 
         #[cfg(windows)]
@@ -450,12 +399,7 @@ pub extern "C" fn helium_c(
     return 0;
 }
 
-fn inflate(
-    zlib_stream: &[u8],
-    width: usize,
-    height: usize,
-    bytes_per_pixel: usize,
-) -> Result<Vec<u8>, ZlibError> {
+fn inflate(zlib_stream: &[u8], header: &Header) -> Result<Vec<u8>, ZlibError> {
     let mut bit_buffer = BitBuffer {
         bits: 0,
         bit_count: 0,
@@ -465,7 +409,7 @@ fn inflate(
     };
 
     // Allocate: Total number of pixels + additional filter bytes for each scanline
-    let num_bytes = (bytes_per_pixel * width + 1) * height;
+    let num_bytes = (header.bytes_per_pixel * header.width + 1) * header.height;
     let mut decoded_stream = Vec::with_capacity(num_bytes);
 
     // Pre-construct fixed Huffman codes
@@ -535,15 +479,79 @@ fn paeth(a: u8, b: u8, c: u8) -> u8 {
     }
 }
 
-fn reconstruct(
-    inflated_stream: &[u8],
+struct Header {
     width: usize,
     height: usize,
     bytes_per_pixel: usize,
-) -> Result<Vec<u8>, PngError> {
-    let bppo = bytes_per_pixel + 1;
-    let scanline_width = bytes_per_pixel * width;
-    let mut unfiltered_stream = Vec::with_capacity(scanline_width * height);
+}
+
+fn parse_header(
+    buffer: &mut [u8; BUFFER_SIZE],
+    crc_table: &[u32; 256],
+    reader: &mut BufReader<File>,
+) -> Result<Header, Box<dyn Error>> {
+    // First four bytes are the length and next four are the name of the header chunk. The length
+    // must be 13 and the name must be a four-byte string 'I' 'H' 'D' 'R'.
+    reader.read_exact(&mut buffer[..4])?;
+    let length = u32::from_be_bytes(buffer[..4].try_into()?);
+    if length != 13 {
+        return Err(Box::new(PngError::InvalidHeaderLength));
+    }
+
+    reader.read_exact(&mut buffer[..17])?;
+    // Make sure we are reading the right chunk. This determines the entire structure of the file
+    if buffer[..4] != IHDR {
+        return Err(Box::new(PngError::MissingHeaderChunk));
+    }
+    // The fields of the IHDR chunk are ordered as retrieved below
+    let width = u32::from_be_bytes(buffer[4..8].try_into()?) as usize;
+    let height = u32::from_be_bytes(buffer[8..12].try_into()?) as usize;
+    let bit_depth = buffer[12];
+    let colour_type = buffer[13];
+    let compression_method = buffer[14];
+    let filter_method = buffer[15];
+    let interlace_method = buffer[16];
+
+    // The interlace method can be 0 or 1. We only support non-interlaced images for now. The filter
+    // and compression methods must both be zero. Finally, we only support images with bit-depths of
+    // 8 bytes-per-pixel.
+    if interlace_method != 0 {
+        return Err(Box::new(PngError::UnsupportedInterlaceMethod));
+    } else if filter_method != 0 {
+        return Err(Box::new(PngError::NonZeroFilterMethod));
+    } else if compression_method != 0 {
+        return Err(Box::new(PngError::NonZeroCompressionMethod));
+    } else if bit_depth != 8 {
+        return Err(Box::new(PngError::UnsupportedBitDepth(bit_depth)));
+    }
+
+    let crc = update_crc(0xFFFFFFFF, &buffer[..17], crc_table) ^ 0xFFFFFFFF;
+    reader.read_exact(&mut buffer[..4])?;
+    let file_crc = u32::from_be_bytes(buffer[..4].try_into()?);
+    if file_crc != crc {
+        return Err(Box::new(PngError::InvalidChunkCRC(file_crc, crc)));
+    }
+
+    let bytes_per_pixel = match colour_type {
+        0 => 1,
+        2 => 3,
+        3 => 1,
+        4 => 2,
+        6 => 4,
+        _ => return Err(Box::new(PngError::InvalidColourType)),
+    };
+    let header = Header {
+        width,
+        height,
+        bytes_per_pixel,
+    };
+    return Ok(header);
+}
+
+fn reconstruct(inflated_stream: &[u8], header: &Header) -> Result<Vec<u8>, PngError> {
+    let bppo = header.bytes_per_pixel + 1;
+    let scanline_width = header.bytes_per_pixel * header.width;
+    let mut unfiltered_stream = Vec::with_capacity(scanline_width * header.height);
     let filter_byte_index = scanline_width + 1;
 
     match inflated_stream[0] {
@@ -571,7 +579,7 @@ fn reconstruct(
         _ => return Err(PngError::UnknownFilterType),
     };
 
-    for scanline in 1..height {
+    for scanline in 1..header.height {
         let filter_byte = scanline * filter_byte_index;
         let first_byte = filter_byte + 1;
         let unfiltered_cs = scanline * scanline_width;
@@ -583,7 +591,7 @@ fn reconstruct(
             ),
             1 => {
                 unfiltered_stream.extend_from_slice(
-                    &inflated_stream[first_byte..(first_byte + bytes_per_pixel)],
+                    &inflated_stream[first_byte..(first_byte + header.bytes_per_pixel)],
                 );
                 for byte in bppo..filter_byte_index {
                     let x = inflated_stream[filter_byte + byte];
@@ -601,7 +609,7 @@ fn reconstruct(
                 }
             }
             3 => {
-                for byte in 0..bytes_per_pixel {
+                for byte in 0..header.bytes_per_pixel {
                     let x = inflated_stream[first_byte + byte];
                     let b = unfiltered_stream[unfiltered_ps + byte];
                     let (value, _) = x.overflowing_add(b >> 1);
@@ -618,7 +626,7 @@ fn reconstruct(
                 }
             }
             4 => {
-                for byte in 0..bytes_per_pixel {
+                for byte in 0..header.bytes_per_pixel {
                     let x = inflated_stream[first_byte + byte];
                     let b = unfiltered_stream[unfiltered_ps + byte];
                     let (value, _) = x.overflowing_add(paeth(0, b, 0));
@@ -639,7 +647,7 @@ fn reconstruct(
         }
     }
 
-    if unfiltered_stream.len() != (scanline_width * height) {
+    if unfiltered_stream.len() != (scanline_width * header.height) {
         return Err(PngError::PartialOrOverReconstruction);
     } else {
         return Ok(unfiltered_stream);

@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
     let write_ppm = match args.next() {
-        Some(i) => if i == "true" { true } else { false },
+        Some(i) => i == "true",
         None => false,
     };
 
