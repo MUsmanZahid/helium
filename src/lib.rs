@@ -91,7 +91,7 @@ impl HuffmanCode {
     }
 
     // code_bit_lengths must appear lexicographic order of the alphabet
-    fn new<'n>(code_bit_lengths: &'n [u8], max_bit_length: usize) -> Self {
+    fn new(code_bit_lengths: &[u8], max_bit_length: usize) -> Self {
         let mut counts = vec![0; max_bit_length];
         let mut map = vec![Vec::new(); max_bit_length];
 
@@ -329,7 +329,7 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
         Err(PngError::NonZeroFilterMethod)?
     } else if compression_method != 0 {
         Err(PngError::NonZeroCompressionMethod)?
-    } else if bit_depth != 0 {
+    } else if bit_depth != 8 {
         Err(PngError::UnsupportedBitDepth(bit_depth))?
     }
 
