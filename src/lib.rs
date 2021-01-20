@@ -17,18 +17,6 @@ const DISTANCE_EXTRA_BITS: [u8; 30] = [
     0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
     13,
 ];
-const FIXED_DISTANCE_BIT_LENGTHS: [u8; 29] = [5; 29];
-const FIXED_LL_BIT_LENGTHS: [u8; 288] = [
-    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
-    9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
-    9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
-    9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
-    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 8, 8, 8, 8, 8, 8, 8, 8,
-];
 const IDAT: [u8; 4] = [73, 68, 65, 84];
 const IEND: [u8; 4] = [73, 69, 78, 68];
 const IHDR: [u8; 4] = [73, 72, 68, 82];
@@ -70,21 +58,60 @@ impl<'s> BitBuffer<'s> {
 
         return Ok(value as u16);
     }
+
+    fn peek_bits<'b>(&'b mut self, count: u8) -> Result<u16, ZlibError> {
+        if self.bit_count < count {
+            let repeat = usize::min((64 - self.bit_count as usize) / 8, self.length - self.index);
+            for _ in 0..repeat {
+                match self.stream.get(self.index) {
+                    Some(&i) => self.bits |= (i as u64) << self.bit_count,
+                    None => return Err(ZlibError::StreamOverflow),
+                }
+                self.bit_count += 8;
+                self.index += 1;
+            }
+        }
+
+        let value = self.bits & ((1u64 << count) - 1);
+        return Ok(value as u16);
+    }
+
+    fn throw_bits<'b>(&'b mut self, count: u8) {
+        self.bits >>= count;
+        self.bit_count -= count;
+    }
 }
 
 struct HuffmanCode {
-    codes: Vec<u16>,
-    map: Vec<Vec<u16>>,
+    codes: [u16; 16],
+    map: [Vec<u16>; 16],
 }
 
 impl HuffmanCode {
     fn decode<'b, 's>(&'b self, bit_buffer: &'b mut BitBuffer<'s>) -> Result<u16, ZlibError> {
-        let mut code = 0;
-        for bit in 0..self.codes.len() {
-            code = (code << 1) | bit_buffer.bits(1)?;
+        let bits = bit_buffer.peek_bits(15)?.reverse_bits() >> 1;
+        for bit in (1..16).step_by(3) {
+            let code = bits >> (15 - bit);
             let start = self.codes.get(bit).ok_or(ZlibError::InvalidBitLength)?;
             let bit_codes = self.map.get(bit).ok_or(ZlibError::InvalidBitLength)?;
             if let Some(&value) = bit_codes.get((code - start) as usize) {
+                bit_buffer.throw_bits(bit as u8);
+                return Ok(value);
+            }
+
+            let code1 = bits >> (14 - bit);
+            let code1_start = self.codes.get(bit + 1).ok_or(ZlibError::InvalidBitLength)?;
+            let code1_bit_codes = self.map.get(bit + 1).ok_or(ZlibError::InvalidBitLength)?;
+            if let Some(&value) = code1_bit_codes.get((code1 - code1_start) as usize) {
+                bit_buffer.throw_bits((bit + 1) as u8);
+                return Ok(value);
+            }
+
+            let code2 = bits >> (13 - bit);
+            let code2_start = self.codes.get(bit + 2).ok_or(ZlibError::InvalidBitLength)?;
+            let code2_bit_codes = self.map.get(bit + 2).ok_or(ZlibError::InvalidBitLength)?;
+            if let Some(&value) = code2_bit_codes.get((code2 - code2_start) as usize) {
+                bit_buffer.throw_bits((bit + 2) as u8);
                 return Ok(value);
             }
         }
@@ -93,25 +120,28 @@ impl HuffmanCode {
     }
 
     // code_bit_lengths must appear lexicographic order of the alphabet
-    fn new(code_bit_lengths: &[u8], max_bit_length: usize) -> Self {
-        let mut counts = vec![0; max_bit_length];
-        let mut map = vec![Vec::new(); max_bit_length];
-
+    fn new(code_bit_lengths: &[u8]) -> Self {
+        let mut counts = [0; 16];
+        let mut map: [Vec<u16>; 16] = [
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(),
+        ];
         for (i, &bit_length) in code_bit_lengths.iter().enumerate() {
             let bit_length = bit_length as usize;
             if 0 < bit_length {
-                if let Some(count) = counts.get_mut(bit_length - 1) {
-                    *count += 1;
+                if let Some(c) = counts.get_mut(bit_length) {
+                    *c += 1;
                 }
-                if let Some(v) = map.get_mut(bit_length - 1) {
-                    v.push(i as u16);
+                if let Some(m) = map.get_mut(bit_length) {
+                    m.push(i as u16);
                 }
             }
         }
 
-        let mut codes = vec![0; max_bit_length + 1];
+        let mut codes = [0; 16];
         let mut start = 0;
-        for bit in 1..(max_bit_length + 1) {
+        for bit in 1..16 {
             start = (start + counts[bit - 1]) << 1;
             if let Some(c) = codes.get_mut(bit) {
                 *c = start;
@@ -187,6 +217,29 @@ fn decode_block<'b, 's>(
     }
 }
 
+fn decode_fixed<'b, 's>(bit_buffer: &'b mut BitBuffer<'s>) -> Result<u16, ZlibError> {
+    let bits = bit_buffer.peek_bits(9)?.reverse_bits() >> 7;
+    let eight = bits & 0xFF;
+    let nine = bits & 0x1FF;
+
+    if (bits & 0x7F) < 24 {
+        bit_buffer.throw_bits(7);
+        return Ok(256 + (bits & 0x7F));
+    } else if (47 < eight) && (eight < 200) {
+        bit_buffer.throw_bits(8);
+        if eight < 144 {
+            return Ok(eight);
+        } else {
+            return Ok(136 + eight);
+        }
+    } else if (399 < nine) && (nine < 512) {
+        bit_buffer.throw_bits(9);
+        return Ok(144 + nine);
+    } else {
+        return Err(ZlibError::InvalidHuffmanCode);
+    }
+}
+
 fn dynamic<'b, 's>(
     bit_buffer: &'b mut BitBuffer<'s>,
     decoded_stream: &'b mut Vec<u8>,
@@ -210,7 +263,7 @@ fn dynamic<'b, 's>(
         }
     }
 
-    let cc = HuffmanCode::new(&cc_bit_lengths, 7);
+    let cc = HuffmanCode::new(&cc_bit_lengths);
     let mut code_lengths = vec![0; hlit + hdist];
     let mut num_decoded = 0;
     let mut last_code = 0;
@@ -241,8 +294,8 @@ fn dynamic<'b, 's>(
     let mut distance_bit_lengths = [0; 32];
     distance_bit_lengths[..hdist].copy_from_slice(&code_lengths[hlit..]);
 
-    let literal_length = HuffmanCode::new(&ll_bit_lengths, 15);
-    let distance = HuffmanCode::new(&distance_bit_lengths, 15);
+    let literal_length = HuffmanCode::new(&ll_bit_lengths);
+    let distance = HuffmanCode::new(&distance_bit_lengths);
     return decode_block(bit_buffer, decoded_stream, &distance, &literal_length);
 }
 
@@ -295,7 +348,9 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
     // First 8-bytes of a PNG file are its identifying magic number
     reader.read_exact(&mut buffer[..8])?;
     if buffer[..8] != MAGIC_NUMBER {
-        return Err(Box::new(PngError::InvalidMagicNumber(buffer[..8].try_into()?)));
+        return Err(Box::new(PngError::InvalidMagicNumber(
+            buffer[..8].try_into()?,
+        )));
     }
     let header = parse_header(&mut buffer, &crc_table, &mut reader)?;
 
@@ -412,10 +467,6 @@ fn inflate(zlib_stream: &[u8], header: &Header) -> Result<Vec<u8>, ZlibError> {
     let num_bytes = (header.bytes_per_pixel * header.width + 1) * header.height;
     let mut decoded_stream = Vec::with_capacity(num_bytes);
 
-    // Pre-construct fixed Huffman codes
-    let fixed_literal_length = HuffmanCode::new(&FIXED_LL_BIT_LENGTHS, 9);
-    let fixed_distance = HuffmanCode::new(&FIXED_DISTANCE_BIT_LENGTHS, 5);
-
     loop {
         let last_block = bit_buffer.bits(1)? == 1;
         match bit_buffer.bits(2)? {
@@ -438,12 +489,35 @@ fn inflate(zlib_stream: &[u8], header: &Header) -> Result<Vec<u8>, ZlibError> {
                     decoded_stream.push(value);
                 }
             }
-            1 => decode_block(
-                &mut bit_buffer,
-                &mut decoded_stream,
-                &fixed_distance,
-                &fixed_literal_length,
-            )?,
+            1 => {
+                // Fixed Huffman Code block
+                loop {
+                    match decode_fixed(&mut bit_buffer)? {
+                        x @ 0..=255 => decoded_stream.push(x as u8),
+                        256 => break (),
+                        x @ 257..=285 => {
+                            let length_index = x as usize - 257;
+                            let extra_bits = LENGTH_EXTRA_BITS[length_index];
+                            let extra_length = bit_buffer.bits(extra_bits)?;
+                            let length = LENGTHS[length_index] + extra_length;
+
+                            // Get distance code
+                            let distance_index = (bit_buffer.bits(5)?.reverse_bits() >> 11) as usize;
+                            let extra_bits = DISTANCE_EXTRA_BITS[distance_index];
+                            let extra_distance = bit_buffer.bits(extra_bits)?;
+                            let distance = DISTANCES[distance_index] + extra_distance;
+
+                            let current_length = decoded_stream.len();
+                            for i in 0..length {
+                                let index = current_length - distance as usize + i as usize;
+                                let value = decoded_stream[index];
+                                decoded_stream.push(value);
+                            }
+                        }
+                        _ => return Err(ZlibError::InvalidLiteralLength),
+                    }
+                }
+            },
             2 => dynamic(&mut bit_buffer, &mut decoded_stream)?,
             _ => return Err(ZlibError::UnknownBlockCompression),
         }
