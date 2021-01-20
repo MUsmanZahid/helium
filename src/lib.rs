@@ -129,23 +129,22 @@ impl HuffmanCode {
         ];
         for (i, &bit_length) in code_bit_lengths.iter().enumerate() {
             let bit_length = bit_length as usize;
-            if 0 < bit_length {
-                if let Some(c) = counts.get_mut(bit_length) {
-                    *c += 1;
-                }
-                if let Some(m) = map.get_mut(bit_length) {
-                    m.push(i as u16);
-                }
+            if let Some(c) = counts.get_mut(bit_length) {
+                *c += 1;
+            }
+            if let Some(m) = map.get_mut(bit_length) {
+                m.push(i as u16);
             }
         }
+        counts[0] = 0;
+        map[0].clear();
 
+        // Compiler's static analysis should eliminate bounds checks and panic paths for this case
         let mut codes = [0; 16];
         let mut start = 0;
         for bit in 1..16 {
             start = (start + counts[bit - 1]) << 1;
-            if let Some(c) = codes.get_mut(bit) {
-                *c = start;
-            }
+            codes[bit] = start;
         }
 
         return Self { codes, map };
@@ -426,7 +425,7 @@ pub extern "C" fn helium_c(
         #[cfg(windows)]
         {
             use std::os::windows::ffi::OsStringExt;
-            std::ffi::OsString::from_wide(slice)
+            std::ffi::OsString::from_wide(*slice)
         }
     };
 
