@@ -166,6 +166,7 @@ enum ZlibError {
     InvalidHCLEN,
     InvalidHuffmanCode,
     InvalidLiteralLength,
+    InvalidRawBlock,
     PartialStreamInflation,
     StreamOverflow,
     UnknownBlockCompression,
@@ -481,7 +482,9 @@ fn inflate(zlib_stream: &[u8], header: &Header) -> Result<Vec<u8>, ZlibError> {
                 // 3. Length bytes of raw pixel data
                 let length = bit_buffer.bits(16)?;
                 let ones_complement = bit_buffer.bits(16)?;
-                assert_eq!(length ^ 0xFFFF, ones_complement);
+                if (length ^ 0xFFFF) != ones_complement {
+                    return Err(ZlibError::InvalidRawBlock);
+                }
 
                 for _ in 0..length {
                     let value = bit_buffer.bits(8)? as u8;
