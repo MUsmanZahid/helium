@@ -8,7 +8,7 @@ use std::{
     slice,
 };
 
-const BUFFER_SIZE: usize = 2 * 1024;
+const BUFFER_SIZE: usize = 4 * 1024;
 const DISTANCES: [u16; 30] = [
     1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
     2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
@@ -27,7 +27,7 @@ const LENGTHS: [u16; 29] = [
 const LENGTH_EXTRA_BITS: [u8; 29] = [
     0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
 ];
-const MAGIC_NUMBER: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
+const PNG_MAGIC_NUMBER: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
 const NUM_8BIT_CRCS: usize = 256;
 
 struct BitBuffer<'s> {
@@ -39,23 +39,11 @@ struct BitBuffer<'s> {
 }
 
 impl<'s> BitBuffer<'s> {
+    /// Consumes count number of bits from the stream stored in the BitBuffer.
+    /// Returns a 16-bit unsigned integer unless the stream has overflowed.
     fn bits<'b>(&'b mut self, count: u8) -> Result<u16, ZlibError> {
-        if self.bit_count < count {
-            let repeat = usize::min((64 - self.bit_count as usize) / 8, self.length - self.index);
-            for _ in 0..repeat {
-                match self.stream.get(self.index) {
-                    Some(&i) => self.bits |= (i as u64) << self.bit_count,
-                    None => return Err(ZlibError::StreamOverflow),
-                }
-                self.bit_count += 8;
-                self.index += 1;
-            }
-        }
-
-        let value = self.bits & ((1u64 << count) - 1);
-        self.bits >>= count;
-        self.bit_count -= count;
-
+        let value = self.peek_bits(count)?;
+        self.throw_bits(count);
         return Ok(value as u16);
     }
 
@@ -89,29 +77,50 @@ struct HuffmanCode {
 
 impl HuffmanCode {
     fn decode<'b, 's>(&'b self, bit_buffer: &'b mut BitBuffer<'s>) -> Result<u16, ZlibError> {
+        // Do not consume any bits from the buffer. The maximum number of bits we can have in a given
+        // Huffman code are 15.
         let bits = bit_buffer.peek_bits(15)?.reverse_bits() >> 1;
-        for bit in (1..16).step_by(3) {
-            let code = bits >> (15 - bit);
-            let start = self.codes.get(bit).ok_or(ZlibError::InvalidBitLength)?;
-            let bit_codes = self.map.get(bit).ok_or(ZlibError::InvalidBitLength)?;
+
+        // We process 5 codes in an interation to reduce unnecessary branchs in the for loop.
+        // Approximately speeds up decoding by 4-5%
+        for bit in (1..16).step_by(5) {
+            let mut code = bits >> (15 - bit);
+            let mut start = self.codes.get(bit).ok_or(ZlibError::InvalidBitLength)?;
+            let mut bit_codes = self.map.get(bit).ok_or(ZlibError::InvalidBitLength)?;
             if let Some(&value) = bit_codes.get((code - start) as usize) {
                 bit_buffer.throw_bits(bit as u8);
                 return Ok(value);
             }
 
-            let code1 = bits >> (14 - bit);
-            let code1_start = self.codes.get(bit + 1).ok_or(ZlibError::InvalidBitLength)?;
-            let code1_bit_codes = self.map.get(bit + 1).ok_or(ZlibError::InvalidBitLength)?;
-            if let Some(&value) = code1_bit_codes.get((code1 - code1_start) as usize) {
+            code = bits >> (14 - bit);
+            start = self.codes.get(bit + 1).ok_or(ZlibError::InvalidBitLength)?;
+            bit_codes = self.map.get(bit + 1).ok_or(ZlibError::InvalidBitLength)?;
+            if let Some(&value) = bit_codes.get((code - start) as usize) {
                 bit_buffer.throw_bits((bit + 1) as u8);
                 return Ok(value);
             }
 
-            let code2 = bits >> (13 - bit);
-            let code2_start = self.codes.get(bit + 2).ok_or(ZlibError::InvalidBitLength)?;
-            let code2_bit_codes = self.map.get(bit + 2).ok_or(ZlibError::InvalidBitLength)?;
-            if let Some(&value) = code2_bit_codes.get((code2 - code2_start) as usize) {
+            code = bits >> (13 - bit);
+            start = self.codes.get(bit + 2).ok_or(ZlibError::InvalidBitLength)?;
+            bit_codes = self.map.get(bit + 2).ok_or(ZlibError::InvalidBitLength)?;
+            if let Some(&value) = bit_codes.get((code - start) as usize) {
                 bit_buffer.throw_bits((bit + 2) as u8);
+                return Ok(value);
+            }
+
+            code = bits >> (12 - bit);
+            start = self.codes.get(bit + 3).ok_or(ZlibError::InvalidBitLength)?;
+            bit_codes = self.map.get(bit + 3).ok_or(ZlibError::InvalidBitLength)?;
+            if let Some(&value) = bit_codes.get((code - start) as usize) {
+                bit_buffer.throw_bits((bit + 3) as u8);
+                return Ok(value);
+            }
+
+            code = bits >> (11 - bit);
+            start = self.codes.get(bit + 4).ok_or(ZlibError::InvalidBitLength)?;
+            bit_codes = self.map.get(bit + 4).ok_or(ZlibError::InvalidBitLength)?;
+            if let Some(&value) = bit_codes.get((code - start) as usize) {
+                bit_buffer.throw_bits((bit + 4) as u8);
                 return Ok(value);
             }
         }
@@ -122,11 +131,7 @@ impl HuffmanCode {
     // code_bit_lengths must appear lexicographic order of the alphabet
     fn new(code_bit_lengths: &[u8]) -> Self {
         let mut counts = [0; 16];
-        let mut map: [Vec<u16>; 16] = [
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(),
-        ];
+        let mut map: [Vec<u16>; 16] = Default::default();
         for (i, &bit_length) in code_bit_lengths.iter().enumerate() {
             let bit_length = bit_length as usize;
             if let Some(c) = counts.get_mut(bit_length) {
@@ -162,12 +167,16 @@ pub struct Image {
 enum ZlibError {
     InvalidBitLength,
     InvalidCodeLength,
+    InvalidCompressionMethod,
     InvalidDistance,
+    InvalidFCHECK,
     InvalidHCLEN,
     InvalidHuffmanCode,
     InvalidLiteralLength,
     InvalidRawBlock,
+    InvalidWindowLength,
     PartialStreamInflation,
+    PresetDictionaryPresent,
     StreamOverflow,
     UnknownBlockCompression,
 }
@@ -214,29 +223,6 @@ fn decode_block<'b, 's>(
             }
             _ => break Err(ZlibError::InvalidLiteralLength),
         }
-    }
-}
-
-fn decode_fixed<'b, 's>(bit_buffer: &'b mut BitBuffer<'s>) -> Result<u16, ZlibError> {
-    let bits = bit_buffer.peek_bits(9)?.reverse_bits() >> 7;
-    let eight = bits & 0xFF;
-    let nine = bits & 0x1FF;
-
-    if (bits & 0x7F) < 24 {
-        bit_buffer.throw_bits(7);
-        return Ok(256 + (bits & 0x7F));
-    } else if (47 < eight) && (eight < 200) {
-        bit_buffer.throw_bits(8);
-        if eight < 144 {
-            return Ok(eight);
-        } else {
-            return Ok(136 + eight);
-        }
-    } else if (399 < nine) && (nine < 512) {
-        bit_buffer.throw_bits(9);
-        return Ok(144 + nine);
-    } else {
-        return Err(ZlibError::InvalidHuffmanCode);
     }
 }
 
@@ -322,32 +308,35 @@ impl Display for PngError {
 
 impl Error for PngError {}
 
+fn generate_crc_table() -> [u32; NUM_8BIT_CRCS] {
+    let mut table = [0; NUM_8BIT_CRCS];
+
+    for (mut i, c) in table.iter_mut().enumerate() {
+        for _ in 0..8 {
+            i = if (i & 1) == 1 {
+                0xEDB88320 ^ (i >> 1)
+            } else {
+                i >> 1
+            }
+        }
+
+        *c = i as u32;
+    }
+
+    return table;
+}
+
 pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
     let file = File::open(file_name)?;
     let mut reader = BufReader::new(file);
     let mut buffer = [0; BUFFER_SIZE];
 
     // Generate a table of 32-bit CRC's of all possible 8-bit values.
-    let crc_table: [u32; NUM_8BIT_CRCS] = {
-        let mut table = [0; NUM_8BIT_CRCS];
-        for (mut n, c) in table.iter_mut().enumerate() {
-            for _ in 0..8 {
-                n = if (n & 1) == 1 {
-                    0xEDB88320 ^ (n >> 1)
-                } else {
-                    n >> 1
-                }
-            }
-
-            *c = n as u32;
-        }
-
-        table
-    };
+    let crc_table = generate_crc_table();
 
     // First 8-bytes of a PNG file are its identifying magic number
     reader.read_exact(&mut buffer[..8])?;
-    if buffer[..8] != MAGIC_NUMBER {
+    if buffer[..8] != PNG_MAGIC_NUMBER {
         return Err(Box::new(PngError::InvalidMagicNumber(
             buffer[..8].try_into()?,
         )));
@@ -361,9 +350,10 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
         reader.read_exact(&mut buffer[..8])?;
         let length = u32::from_be_bytes(buffer[..4].try_into()?) as usize;
         chunk_type.copy_from_slice(&buffer[4..8]);
-        let mut crc = update_crc(0xFFFFFFFF, &buffer[4..8], &crc_table);
+        let mut crc = update_crc(0xFFFF_FFFF, &buffer[4..8], &crc_table);
 
         if chunk_type == IDAT {
+            // Reserve space here so `extend_from_slice` is more efficient
             zlib_stream.reserve(length);
             let mut bytes_read = 0;
             while bytes_read < length {
@@ -383,7 +373,8 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
             }
         }
 
-        crc ^= 0xFFFFFFFF;
+        // Need to invert the bits in the calculated CRC at the end so we XOR with 0xFFFFFFFF.
+        crc ^= 0xFFFF_FFFF;
         reader.read_exact(&mut buffer[..4])?;
         let file_crc = u32::from_be_bytes(buffer[..4].try_into()?);
         if file_crc != crc {
@@ -391,7 +382,7 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
         }
     }
 
-    let inflated_stream = inflate(&zlib_stream[2..], &header)?;
+    let inflated_stream = inflate(&zlib_stream, &header)?;
     let image_data = reconstruct(&inflated_stream, &header)?;
     return Ok(Image {
         width: header.width as u32,
@@ -404,7 +395,7 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
 #[no_mangle]
 pub extern "C" fn helium_c(
     #[cfg(windows)] file_name: *const u16,
-    #[cfg(unix)] file_name: *const u8,
+    #[cfg(not(windows))] file_name: *const u8,
     width: *mut u32,
     height: *mut u32,
     num_channels: *mut i32,
@@ -417,7 +408,7 @@ pub extern "C" fn helium_c(
     let name = unsafe {
         let length = (0..).take_while(|&i| *file_name.offset(i) != 0).count();
         let slice = ManuallyDrop::new(slice::from_raw_parts(file_name, length));
-        #[cfg(unix)]
+        #[cfg(not(windows))]
         {
             use std::os::unix::ffi::OsStrExt;
             std::ffi::OsStr::from_bytes(*slice)
@@ -455,30 +446,78 @@ pub extern "C" fn helium_c(
 }
 
 fn inflate(zlib_stream: &[u8], header: &Header) -> Result<Vec<u8>, ZlibError> {
+    // We need to start by validating the first two bytes of the ZLIB stream.
+    // First comes the compression method and flags (CMF) byte. Bits 0-3 (4-bits) store the
+    // compression method (CM) and bits 4-7 store the compression info (CINFO).
+    let cmf = zlib_stream[0];
+
+    // A CM value of 8 indicate the "DEFLATE" compression method with a window size up to 32Kb. This
+    // is the only method defined by the specification, hence, CM can only be 8.
+    let cm = cmf & 0xF;
+    if cm != 8 {
+        return Err(ZlibError::InvalidCompressionMethod);
+    }
+
+    // CINFO is the base-2 logarithm of of the LZ77-compression window size, minus eight used to
+    // encode this DEFLATE stream. Values of CINFO above 7 are not allowed by the specification as
+    // 2^(7 + 8) = 32767. Storing this value is not neccessary.
+    let cinfo = cmf >> 4;
+    if cinfo > 7 {
+        return Err(ZlibError::InvalidWindowLength);
+    }
+
+    // Second comes the flags (FLG) byte. Bits 0-4 (5-bits) specify the check bits for CMF and FLG
+    // (FCHECK), bit 5 specifies whether there is a preset dictionary present (FDICT), and bits 6-7
+    // indicate the compression level (FLEVEL) - the FLEVEL value can be safely ignored, hence, we do
+    // not bother checking it.
+    let flg = zlib_stream[1];
+
+    // FCHECK must be a value such that when CMF and FLG are viewed as a 16-bit unsigned integer
+    // stored in MSB order, FCHECK is a multiple of 31. Hence, we do not directly check the FCHECK
+    // value.
+    let integer = ((cmf as u16) << 8) | (flg as u16);
+    if (integer % 31) != 0 {
+        return Err(ZlibError::InvalidFCHECK);
+    }
+
+    // Currently we do not support decompression in the presence of a preset dictionary as this is not
+    // required by the PNG specification.
+    let fdict = (flg & 0x20) >> 5;
+    if fdict == 1 {
+        return Err(ZlibError::PresetDictionaryPresent);
+    }
+
     let mut bit_buffer = BitBuffer {
         bits: 0,
         bit_count: 0,
         index: 0,
-        length: zlib_stream.len(),
-        stream: zlib_stream,
+        length: zlib_stream.len() - 2,
+        stream: &zlib_stream[2..],
     };
 
-    // Allocate: Total number of pixels + additional filter bytes for each scanline
+    // Total allocation = Total number of pixels + additional filter bytes for each scanline (the + 1)
     let num_bytes = (header.bytes_per_pixel * header.width + 1) * header.height;
     let mut decoded_stream = Vec::with_capacity(num_bytes);
 
-    loop {
-        let last_block = bit_buffer.bits(1)? == 1;
+    let mut last_block = false;
+    while !last_block {
+        // The first three bits are a part of the block header. Bit
+        // Bit 0 indicates whether the block is the last or not
+        // Bits 1-2 indicate the type of the block:
+        // - 0 => Raw data block
+        // - 1 => Block stored with Fixed Huffman Code compression
+        // - 2 => Block stored with Dynamic Huffman Code compression
+        last_block = bit_buffer.bits(1)? == 1;
         match bit_buffer.bits(2)? {
             0 => {
-                // Raw literal block
-                // Clear the rest of the bits in the buffer. They are useless.
-                bit_buffer.bits >>= 5;
-                bit_buffer.bit_count -= 5;
+                // The fixed block starts on the next byte boundary. We have just used 3 bits to
+                // get here, now we throw away the rest of the 5 bits in this byte.
+                bit_buffer.throw_bits(5);
 
-                // Block is defined by two bytes:
+                // The raw data block is defined by two bytes:
                 // 1. Length of the block
-                // 2. One's complement of the length - for safety.
+                // 2. One's complement of the length. This is used to ensure that we do not
+                // misinterpret the start of a raw block.
                 // 3. Length bytes of raw pixel data
                 let length = bit_buffer.bits(16)?;
                 let ones_complement = bit_buffer.bits(16)?;
@@ -491,41 +530,9 @@ fn inflate(zlib_stream: &[u8], header: &Header) -> Result<Vec<u8>, ZlibError> {
                     decoded_stream.push(value);
                 }
             }
-            1 => {
-                // Fixed Huffman Code block
-                loop {
-                    match decode_fixed(&mut bit_buffer)? {
-                        x @ 0..=255 => decoded_stream.push(x as u8),
-                        256 => break (),
-                        x @ 257..=285 => {
-                            let length_index = x as usize - 257;
-                            let extra_bits = LENGTH_EXTRA_BITS[length_index];
-                            let extra_length = bit_buffer.bits(extra_bits)?;
-                            let length = LENGTHS[length_index] + extra_length;
-
-                            // Get distance code
-                            let distance_index = (bit_buffer.bits(5)?.reverse_bits() >> 11) as usize;
-                            let extra_bits = DISTANCE_EXTRA_BITS[distance_index];
-                            let extra_distance = bit_buffer.bits(extra_bits)?;
-                            let distance = DISTANCES[distance_index] + extra_distance;
-
-                            let current_length = decoded_stream.len();
-                            for i in 0..length {
-                                let index = current_length - distance as usize + i as usize;
-                                let value = decoded_stream[index];
-                                decoded_stream.push(value);
-                            }
-                        }
-                        _ => return Err(ZlibError::InvalidLiteralLength),
-                    }
-                }
-            },
+            1 => todo!(),
             2 => dynamic(&mut bit_buffer, &mut decoded_stream)?,
             _ => return Err(ZlibError::UnknownBlockCompression),
-        }
-
-        if last_block {
-            break;
         }
     }
 
@@ -536,6 +543,7 @@ fn inflate(zlib_stream: &[u8], header: &Header) -> Result<Vec<u8>, ZlibError> {
     }
 }
 
+#[inline]
 fn paeth(a: u8, b: u8, c: u8) -> u8 {
     let a16 = a as i16;
     let b16 = b as i16;
@@ -567,7 +575,7 @@ fn parse_header(
     reader: &mut BufReader<File>,
 ) -> Result<Header, Box<dyn Error>> {
     // First four bytes are the length and next four are the name of the header chunk. The length
-    // must be 13 and the name must be a four-byte string 'I' 'H' 'D' 'R'.
+    // must be 13 and the name must be a four-byte string "IHDR".
     reader.read_exact(&mut buffer[..4])?;
     let length = u32::from_be_bytes(buffer[..4].try_into()?);
     if length != 13 {
@@ -590,7 +598,7 @@ fn parse_header(
 
     // The interlace method can be 0 or 1. We only support non-interlaced images for now. The filter
     // and compression methods must both be zero. Finally, we only support images with bit-depths of
-    // 8 bytes-per-pixel.
+    // 8 bits-per-pixel.
     if interlace_method != 0 {
         return Err(Box::new(PngError::UnsupportedInterlaceMethod));
     } else if filter_method != 0 {
@@ -630,6 +638,13 @@ fn reconstruct(inflated_stream: &[u8], header: &Header) -> Result<Vec<u8>, PngEr
     let mut unfiltered_stream = Vec::with_capacity(scanline_width * header.height);
     let filter_byte_index = scanline_width + 1;
 
+    // We start to reconstruct the PNG image from the inflated ZLIB (DEFLATE) stream. There are five
+    // filter methods present in the PNG specification:
+    // 0 (None) -> ,
+    // 1 (Sub) -> ,
+    // 2 (Up) -> ,
+    // 3 (Average) -> ,
+    // 4 (Paeth) -> ,
     match inflated_stream[0] {
         0 | 2 => unfiltered_stream.extend_from_slice(&inflated_stream[1..filter_byte_index]),
         1 => {
@@ -730,6 +745,8 @@ fn reconstruct(inflated_stream: &[u8], header: &Header) -> Result<Vec<u8>, PngEr
     }
 }
 
+/// Port of the CRC algorithm descibed in the PNG specification -
+/// https://www.w3.org/TR/PNG/#D-CRCAppendix
 fn update_crc(mut crc: u32, buffer: &[u8], crc_table: &[u32; 256]) -> u32 {
     for i in buffer {
         crc = crc_table[(crc ^ *i as u32) as usize & 0xFF] ^ (crc >> 8);
