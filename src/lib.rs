@@ -1,3 +1,5 @@
+mod metadata;
+
 use std::{
     convert::TryInto,
     error::Error,
@@ -40,14 +42,22 @@ struct BitBuffer<'s> {
 
 impl<'s> BitBuffer<'s> {
     /// Consumes count number of bits from the stream stored in the BitBuffer.
-    /// Returns a 16-bit unsigned integer unless the stream has overflowed.
+    /// Returns a 16-bit unsigned integer unless the stream has overflowed in which case it returns
+    /// an error.
     fn bits<'b>(&'b mut self, count: u8) -> Result<u16, ZlibError> {
         let value = self.peek_bits(count)?;
         self.throw_bits(count);
         return Ok(value as u16);
     }
 
+    /// Retrieves count number of bits from the stream stored in the BitBuffer without consuming
+    /// them.
+    ///
+    /// Returns a 16-bit unsigned integer unless the stream has overflowed, in which case it
+    /// returns an error.
     fn peek_bits<'b>(&'b mut self, count: u8) -> Result<u16, ZlibError> {
+        // We try to store as many bits as we can at a given time in order to more successfully
+        // predict this branch.
         if self.bit_count < count {
             let repeat = usize::min((64 - self.bit_count as usize) / 8, self.length - self.index);
             for _ in 0..repeat {
@@ -64,9 +74,81 @@ impl<'s> BitBuffer<'s> {
         return Ok(value as u16);
     }
 
+    /// Discards count bits from the BitBuffer.
     fn throw_bits<'b>(&'b mut self, count: u8) {
         self.bits >>= count;
         self.bit_count -= count;
+    }
+}
+
+struct Header {
+    width: usize,
+    height: usize,
+    bytes_per_pixel: usize,
+}
+
+impl Header {
+    fn parse(
+        buffer: &mut [u8; BUFFER_SIZE],
+        crc_table: &[u32; 256],
+        reader: &mut BufReader<File>,
+    ) -> Result<Self, Box<dyn Error>> {
+        // First four bytes are the length and next four are the name of the header chunk. The length
+        // must be 13 and the name must be a four-byte string "IHDR".
+        reader.read_exact(&mut buffer[..4])?;
+        let length = u32::from_be_bytes(buffer[..4].try_into()?);
+        if length != 13 {
+            return Err(Box::new(PngError::InvalidHeaderLength));
+        }
+
+        reader.read_exact(&mut buffer[..17])?;
+        // Make sure we are reading the right chunk. This determines the entire structure of the file
+        if buffer[..4] != IHDR {
+            return Err(Box::new(PngError::MissingHeaderChunk));
+        }
+        // The fields of the IHDR chunk are ordered as retrieved below
+        let width = u32::from_be_bytes(buffer[4..8].try_into()?) as usize;
+        let height = u32::from_be_bytes(buffer[8..12].try_into()?) as usize;
+        let bit_depth = buffer[12];
+        let colour_type = buffer[13];
+        let compression_method = buffer[14];
+        let filter_method = buffer[15];
+        let interlace_method = buffer[16];
+
+        // The interlace method can be 0 or 1. We only support non-interlaced images for now. The filter
+        // and compression methods must both be zero. Finally, we only support images with bit-depths of
+        // 8 bits-per-pixel.
+        if interlace_method != 0 {
+            return Err(Box::new(PngError::UnsupportedInterlaceMethod));
+        } else if filter_method != 0 {
+            return Err(Box::new(PngError::NonZeroFilterMethod));
+        } else if compression_method != 0 {
+            return Err(Box::new(PngError::NonZeroCompressionMethod));
+        } else if bit_depth != 8 {
+            return Err(Box::new(PngError::UnsupportedBitDepth(bit_depth)));
+        }
+
+        let crc = update_crc(0xFFFFFFFF, &buffer[..17], crc_table) ^ 0xFFFFFFFF;
+        reader.read_exact(&mut buffer[..4])?;
+        let file_crc = u32::from_be_bytes(buffer[..4].try_into()?);
+        if file_crc != crc {
+            return Err(Box::new(PngError::InvalidChunkCRC(file_crc, crc)));
+        }
+
+        let bytes_per_pixel = match colour_type {
+            0 => 1,
+            2 => 3,
+            3 => 1,
+            4 => 2,
+            6 => 4,
+            _ => return Err(Box::new(PngError::InvalidColourType)),
+        };
+        let header = Self {
+            width,
+            height,
+            bytes_per_pixel,
+        };
+        return Ok(header);
     }
 }
 
@@ -76,6 +158,9 @@ struct HuffmanCode {
 }
 
 impl HuffmanCode {
+    /// Decodes the actual value from a given set of Huffman codes.
+    // NOTE: We can possibly speed this up by decoding multiple codes at a time if we can get away
+    // with it in 15 bits
     fn decode<'b, 's>(&'b self, bit_buffer: &'b mut BitBuffer<'s>) -> Result<u16, ZlibError> {
         // Do not consume any bits from the buffer. The maximum number of bits we can have in a given
         // Huffman code are 15.
@@ -128,7 +213,12 @@ impl HuffmanCode {
         return Err(ZlibError::InvalidHuffmanCode);
     }
 
-    // code_bit_lengths must appear lexicographic order of the alphabet
+    /// Creates a new set of Huffman codes from an alphabet.
+    ///
+    /// Takes a slice of unsigned 8-bit integers where each integer's index is its alphabet value
+    /// and where each integer's value is the bit length of that alphabet value. Thus, this
+    /// function implicitly assumes that `code_bit_lengths` is in lexicographic order of the
+    /// DEFLATE alphabet.
     fn new(code_bit_lengths: &[u8]) -> Self {
         let mut counts = [0; 16];
         let mut map: [Vec<u16>; 16] = Default::default();
@@ -141,6 +231,9 @@ impl HuffmanCode {
                 m.push(i as u16);
             }
         }
+
+        // It is not possible for there to be a code with zero bits. Therefore, we set the count
+        // of all codes with bit length zero to zero.
         counts[0] = 0;
         map[0].clear();
 
@@ -162,6 +255,43 @@ pub struct Image {
     pub num_channels: u32,
     pub data: Vec<u8>,
 }
+
+#[repr(C)]
+pub struct ImageMetadata {
+    width: u32,
+    height: u32,
+    bits_per_pixel: u32,
+}
+
+enum MetadataError {
+    FileOpenError = 1,
+    FileReadError = 2,
+    InvalidMagicNumber = 3,
+    InvalidHeader = 4,
+}
+
+#[derive(Debug)]
+enum PngError {
+    InvalidColourType,
+    InvalidChunkCRC(u32, u32),
+    InvalidHeaderLength,
+    InvalidMagicNumber([u8; 8]),
+    MissingHeaderChunk,
+    NonZeroCompressionMethod,
+    NonZeroFilterMethod,
+    PartialOrOverReconstruction,
+    UnknownFilterType,
+    UnsupportedBitDepth(u8),
+    UnsupportedInterlaceMethod,
+}
+
+impl Display for PngError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "")
+    }
+}
+
+impl Error for PngError {}
 
 #[derive(Debug)]
 enum ZlibError {
@@ -226,6 +356,7 @@ fn decode_block<'b, 's>(
     }
 }
 
+/// Decodes a dynamic Huffman code block.
 fn dynamic<'b, 's>(
     bit_buffer: &'b mut BitBuffer<'s>,
     decoded_stream: &'b mut Vec<u8>,
@@ -285,29 +416,8 @@ fn dynamic<'b, 's>(
     return decode_block(bit_buffer, decoded_stream, &distance, &literal_length);
 }
 
-#[derive(Debug)]
-enum PngError {
-    InvalidColourType,
-    InvalidChunkCRC(u32, u32),
-    InvalidHeaderLength,
-    InvalidMagicNumber([u8; 8]),
-    MissingHeaderChunk,
-    NonZeroCompressionMethod,
-    NonZeroFilterMethod,
-    PartialOrOverReconstruction,
-    UnknownFilterType,
-    UnsupportedBitDepth(u8),
-    UnsupportedInterlaceMethod,
-}
-
-impl Display for PngError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "")
-    }
-}
-
-impl Error for PngError {}
-
+/// Direct port of the CRC table generation algorithm given in the PNG specification:
+/// https://www.w3.org/TR/PNG/#D-CRCAppendix
 fn generate_crc_table() -> [u32; NUM_8BIT_CRCS] {
     let mut table = [0; NUM_8BIT_CRCS];
 
@@ -326,6 +436,31 @@ fn generate_crc_table() -> [u32; NUM_8BIT_CRCS] {
     return table;
 }
 
+fn get_metadata(file_name: &str) -> Result<ImageMetadata, MetadataError> {
+    let mut file = File::open(file_name).map_err(|_| MetadataError::FileOpenError)?;
+
+    if !metadata::contains_magic_number(&mut file) {
+        return Err(MetadataError::InvalidMagicNumber);
+    }
+    if !metadata::header_valid(&mut file) {
+        return Err(MetadataError::InvalidHeader);
+    }
+
+    let width = read_u32(&mut file).map_err(|_| MetadataError::FileReadError)?;
+    let height = read_u32(&mut file).map_err(|_| MetadataError::FileReadError)?;
+
+    let bit_depth = read_u8(&mut file).map_err(|_| MetadataError::FileReadError)?;
+    let color_type = read_u8(&mut file).map_err(|_| MetadataError::FileReadError)?;
+    let bits_per_pixel = bit_depth as u32 * metadata::bytes_per_pixel(color_type);
+
+    let metadata = ImageMetadata {
+        width,
+        height,
+        bits_per_pixel,
+    };
+    return Ok(metadata);
+}
+
 pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
     let file = File::open(file_name)?;
     let mut reader = BufReader::new(file);
@@ -341,7 +476,7 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
             buffer[..8].try_into()?,
         )));
     }
-    let header = parse_header(&mut buffer, &crc_table, &mut reader)?;
+    let header = Header::parse(&mut buffer, &crc_table, &mut reader)?;
 
     // Collect zlib stream
     let mut zlib_stream = Vec::new();
@@ -382,14 +517,61 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
         }
     }
 
+    let mut start = std::time::Instant::now();
     let inflated_stream = inflate(&zlib_stream, &header)?;
+    let mut end = std::time::Instant::now();
+    println!("{:?}", end - start);
+
+    start = std::time::Instant::now();
     let image_data = reconstruct(&inflated_stream, &header)?;
+    end = std::time::Instant::now();
+    println!("{:?}", end - start);
+
     return Ok(Image {
         width: header.width as u32,
         height: header.height as u32,
         num_channels: header.bytes_per_pixel as u32,
         data: image_data,
     });
+}
+
+#[no_mangle]
+pub extern "C" fn helium_get_metadata(
+    #[cfg(windows)] file_name: *const u16,
+    #[cfg(not(windows))] file_name: *const u8,
+    metadata: *mut ImageMetadata,
+) -> u32 {
+    if file_name.is_null() {
+        return 1;
+    } else if metadata.is_null() {
+        return 2;
+    }
+
+    let name = unsafe {
+        let length = (0..).take_while(|&i| *file_name.offset(i) != 0).count();
+        let slice = ManuallyDrop::new(slice::from_raw_parts(file_name, length));
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            std::ffi::OsString::from_wide(*slice)
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            std::ffi::OsStr::from_bytes(*slice)
+        }
+    };
+
+    match name.to_str() {
+        Some(file_name) => match get_metadata(file_name) {
+            Ok(m) => unsafe { *metadata = m; },
+            // NOTE: Add 3 since we already use 1, 2, and 3 and the enum discriminant starts at 1.
+            Err(e) => return (e as u32) + 3,
+        },
+        None => return 3,
+    }
+
+    return 0;
 }
 
 #[no_mangle]
@@ -445,6 +627,7 @@ pub extern "C" fn helium_c(
     return 0;
 }
 
+/// Attempts to decode (inflate) a stream encoded by the DEFLATE codec.
 fn inflate(zlib_stream: &[u8], header: &Header) -> Result<Vec<u8>, ZlibError> {
     // We need to start by validating the first two bytes of the ZLIB stream.
     // First comes the compression method and flags (CMF) byte. Bits 0-3 (4-bits) store the
@@ -543,6 +726,14 @@ fn inflate(zlib_stream: &[u8], header: &Header) -> Result<Vec<u8>, ZlibError> {
     }
 }
 
+/// A port of the paeth filter described in the PNG specification:
+/// https://www.w3.org/TR/PNG/#9Filter-type-4-Paeth
+///
+/// It attempts to compute a linear function of the neighbouring bytes of a given byte. Given
+/// a byte `x`, let `a` be the byte immediately before x, let `b` be the byte in x's position in
+/// the previous scanline, and let `c` be the byte in a's position in the previous scanline. This
+/// function tries to find in which of the three direction's (vertical, horizontal, and diagonal)
+/// the gradient is the smallest.
 #[inline]
 fn paeth(a: u8, b: u8, c: u8) -> u8 {
     let a16 = a as i16;
@@ -563,73 +754,18 @@ fn paeth(a: u8, b: u8, c: u8) -> u8 {
     }
 }
 
-struct Header {
-    width: usize,
-    height: usize,
-    bytes_per_pixel: usize,
+fn read_u32(f: &mut File) -> std::io::Result<u32> {
+    let mut b = [0; 4];
+    f.read_exact(&mut b[..])?;
+
+    return Ok(u32::from_be_bytes(b));
 }
 
-fn parse_header(
-    buffer: &mut [u8; BUFFER_SIZE],
-    crc_table: &[u32; 256],
-    reader: &mut BufReader<File>,
-) -> Result<Header, Box<dyn Error>> {
-    // First four bytes are the length and next four are the name of the header chunk. The length
-    // must be 13 and the name must be a four-byte string "IHDR".
-    reader.read_exact(&mut buffer[..4])?;
-    let length = u32::from_be_bytes(buffer[..4].try_into()?);
-    if length != 13 {
-        return Err(Box::new(PngError::InvalidHeaderLength));
-    }
+fn read_u8(f: &mut File) -> std::io::Result<u8> {
+    let mut b = [0; 1];
+    f.read_exact(&mut b[..])?;
 
-    reader.read_exact(&mut buffer[..17])?;
-    // Make sure we are reading the right chunk. This determines the entire structure of the file
-    if buffer[..4] != IHDR {
-        return Err(Box::new(PngError::MissingHeaderChunk));
-    }
-    // The fields of the IHDR chunk are ordered as retrieved below
-    let width = u32::from_be_bytes(buffer[4..8].try_into()?) as usize;
-    let height = u32::from_be_bytes(buffer[8..12].try_into()?) as usize;
-    let bit_depth = buffer[12];
-    let colour_type = buffer[13];
-    let compression_method = buffer[14];
-    let filter_method = buffer[15];
-    let interlace_method = buffer[16];
-
-    // The interlace method can be 0 or 1. We only support non-interlaced images for now. The filter
-    // and compression methods must both be zero. Finally, we only support images with bit-depths of
-    // 8 bits-per-pixel.
-    if interlace_method != 0 {
-        return Err(Box::new(PngError::UnsupportedInterlaceMethod));
-    } else if filter_method != 0 {
-        return Err(Box::new(PngError::NonZeroFilterMethod));
-    } else if compression_method != 0 {
-        return Err(Box::new(PngError::NonZeroCompressionMethod));
-    } else if bit_depth != 8 {
-        return Err(Box::new(PngError::UnsupportedBitDepth(bit_depth)));
-    }
-
-    let crc = update_crc(0xFFFFFFFF, &buffer[..17], crc_table) ^ 0xFFFFFFFF;
-    reader.read_exact(&mut buffer[..4])?;
-    let file_crc = u32::from_be_bytes(buffer[..4].try_into()?);
-    if file_crc != crc {
-        return Err(Box::new(PngError::InvalidChunkCRC(file_crc, crc)));
-    }
-
-    let bytes_per_pixel = match colour_type {
-        0 => 1,
-        2 => 3,
-        3 => 1,
-        4 => 2,
-        6 => 4,
-        _ => return Err(Box::new(PngError::InvalidColourType)),
-    };
-    let header = Header {
-        width,
-        height,
-        bytes_per_pixel,
-    };
-    return Ok(header);
+    return Ok(b[0]);
 }
 
 fn reconstruct(inflated_stream: &[u8], header: &Header) -> Result<Vec<u8>, PngError> {

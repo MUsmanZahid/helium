@@ -7,10 +7,10 @@ edition = "2018"
 [dependencies]
 
 [lib]
-crate-type = ["rlib"]
+crate-type = ["staticlib", "rlib"]
 
 [profile.release]
-debug = true
+debug = false
 lto = true
 opt-level = 3
 overflow-checks = false
