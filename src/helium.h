@@ -1,11 +1,27 @@
 #ifndef HELIUM_H
 #define HELIUM_H
 
-typedef struct ImageMetadata {
+typedef struct Helium_ImageMetadata {
     unsigned int width;
     unsigned int height;
     unsigned int bits_per_pixel;
-} ImageMetadata;
+} Helium_ImageMetadata;
+
+typedef struct Helium_PngData {
+    unsigned int width;
+    unsigned int height;
+    unsigned int num_channels;
+    void*        data;
+} Helium_PngData;
+
+unsigned int helium_decode_png(
+#if defined(_WIN32) || defined(_WIN64)
+    const unsigned short* file_name,
+#else
+    const char* file_name,
+#endif
+    Helium_PngData* png_data
+);
 
 // Attempts to read the PNG file `filename` and retrieve its width, height, and bits per pixel.
 // The metadata is filled into the `ImageMetadata` struct once retrieved.
@@ -24,19 +40,7 @@ unsigned int helium_get_metadata(
 #else
     const char* filename,
 #endif
-    ImageMetadata* metadata
-);
-
-long helium_c(
-#if defined(_WIN32) || defined(_WIN64)
-    unsigned short* filename, // Windows uses UTF-16 for strings. We support that natively.
-#else
-    char* filename, // All other cases use UTF-8
-#endif
-    unsigned long* width,
-    unsigned long* height,
-    long* num_channels,
-    void** data
+    Helium_ImageMetadata* metadata
 );
 
 #endif // HELIUM_H

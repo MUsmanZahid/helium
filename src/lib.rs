@@ -1,11 +1,11 @@
 mod metadata;
 
 use std::{
-    convert::TryInto,
     error::Error,
+    ffi::c_void,
     fmt::{self, Display, Formatter},
     fs::File,
-    io::{BufReader, Read},
+    io::Read,
     mem::ManuallyDrop,
     slice,
 };
@@ -89,31 +89,28 @@ struct Header {
 
 impl Header {
     fn parse(
-        buffer: &mut [u8; BUFFER_SIZE],
         crc_table: &[u32; 256],
-        reader: &mut BufReader<File>,
+        file: &mut File,
     ) -> Result<Self, Box<dyn Error>> {
         // First four bytes are the length and next four are the name of the header chunk. The length
         // must be 13 and the name must be a four-byte string "IHDR".
-        reader.read_exact(&mut buffer[..4])?;
-        let length = u32::from_be_bytes(buffer[..4].try_into()?);
-        if length != 13 {
-            return Err(Box::new(PngError::InvalidHeaderLength));
-        }
+        if !metadata::header_valid(file) { return Err(Box::new(PngError::InvalidHeader)); }
 
-        reader.read_exact(&mut buffer[..17])?;
-        // Make sure we are reading the right chunk. This determines the entire structure of the file
-        if buffer[..4] != IHDR {
-            return Err(Box::new(PngError::MissingHeaderChunk));
-        }
+        let mut b = [0; 17];
+        b[0] = 'I' as u8;
+        b[1] = 'H' as u8;
+        b[2] = 'D' as u8;
+        b[3] = 'R' as u8;
+        file.read_exact(&mut b[4..17])?;
+
         // The fields of the IHDR chunk are ordered as retrieved below
-        let width = u32::from_be_bytes(buffer[4..8].try_into()?) as usize;
-        let height = u32::from_be_bytes(buffer[8..12].try_into()?) as usize;
-        let bit_depth = buffer[12];
-        let colour_type = buffer[13];
-        let compression_method = buffer[14];
-        let filter_method = buffer[15];
-        let interlace_method = buffer[16];
+        let width = u32::from_be_bytes([b[4], b[5], b[6], b[7]]) as usize;
+        let height = u32::from_be_bytes([b[8], b[9], b[10], b[11]]) as usize;
+        let bit_depth = b[12];
+        let colour_type = b[13];
+        let compression_method = b[14];
+        let filter_method = b[15];
+        let interlace_method = b[16];
 
         // The interlace method can be 0 or 1. We only support non-interlaced images for now. The filter
         // and compression methods must both be zero. Finally, we only support images with bit-depths of
@@ -128,21 +125,13 @@ impl Header {
             return Err(Box::new(PngError::UnsupportedBitDepth(bit_depth)));
         }
 
-        let crc = update_crc(0xFFFFFFFF, &buffer[..17], crc_table) ^ 0xFFFFFFFF;
-        reader.read_exact(&mut buffer[..4])?;
-        let file_crc = u32::from_be_bytes(buffer[..4].try_into()?);
+        let crc = update_crc(0xFFFFFFFF, &b, crc_table) ^ 0xFFFFFFFF;
+        let file_crc = read_u32(file)?;
         if file_crc != crc {
             return Err(Box::new(PngError::InvalidChunkCRC(file_crc, crc)));
         }
 
-        let bytes_per_pixel = match colour_type {
-            0 => 1,
-            2 => 3,
-            3 => 1,
-            4 => 2,
-            6 => 4,
-            _ => return Err(Box::new(PngError::InvalidColourType)),
-        };
+        let bytes_per_pixel = metadata::bytes_per_pixel(colour_type) as usize;
         let header = Self {
             width,
             height,
@@ -152,6 +141,14 @@ impl Header {
     }
 }
 
+#[repr(C)]
+pub struct Helium_PngData {
+    pub width: u32,
+    pub height: u32,
+    pub num_channels: u32,
+    pub data: *mut c_void,
+}
+
 struct HuffmanCode {
     codes: [u16; 16],
     map: [Vec<u16>; 16],
@@ -159,8 +156,6 @@ struct HuffmanCode {
 
 impl HuffmanCode {
     /// Decodes the actual value from a given set of Huffman codes.
-    // NOTE: We can possibly speed this up by decoding multiple codes at a time if we can get away
-    // with it in 15 bits
     fn decode<'b, 's>(&'b self, bit_buffer: &'b mut BitBuffer<'s>) -> Result<u16, ZlibError> {
         // Do not consume any bits from the buffer. The maximum number of bits we can have in a given
         // Huffman code are 15.
@@ -272,11 +267,9 @@ enum MetadataError {
 
 #[derive(Debug)]
 enum PngError {
-    InvalidColourType,
     InvalidChunkCRC(u32, u32),
-    InvalidHeaderLength,
-    InvalidMagicNumber([u8; 8]),
-    MissingHeaderChunk,
+    InvalidHeader,
+    InvalidMagicNumber,
     NonZeroCompressionMethod,
     NonZeroFilterMethod,
     PartialOrOverReconstruction,
@@ -462,30 +455,26 @@ fn get_metadata(file_name: &str) -> Result<ImageMetadata, MetadataError> {
 }
 
 pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
-    let file = File::open(file_name)?;
-    let mut reader = BufReader::new(file);
+    let mut file = File::open(file_name)?;
     let mut buffer = [0; BUFFER_SIZE];
 
     // Generate a table of 32-bit CRC's of all possible 8-bit values.
     let crc_table = generate_crc_table();
 
     // First 8-bytes of a PNG file are its identifying magic number
-    reader.read_exact(&mut buffer[..8])?;
-    if buffer[..8] != PNG_MAGIC_NUMBER {
-        return Err(Box::new(PngError::InvalidMagicNumber(
-            buffer[..8].try_into()?,
-        )));
+    if !metadata::contains_magic_number(&mut file) {
+        return Err(Box::new(PngError::InvalidMagicNumber));
     }
-    let header = Header::parse(&mut buffer, &crc_table, &mut reader)?;
+    let header = Header::parse(&crc_table, &mut file)?;
 
     // Collect zlib stream
     let mut zlib_stream = Vec::new();
     let mut chunk_type = IHDR;
     while chunk_type != IEND {
-        reader.read_exact(&mut buffer[..8])?;
-        let length = u32::from_be_bytes(buffer[..4].try_into()?) as usize;
-        chunk_type.copy_from_slice(&buffer[4..8]);
-        let mut crc = update_crc(0xFFFF_FFFF, &buffer[4..8], &crc_table);
+        let length = read_u32(&mut file)? as usize;
+        file.read_exact(&mut buffer[..4])?;
+        chunk_type.copy_from_slice(&buffer[..4]);
+        let mut crc = update_crc(0xFFFF_FFFF, &buffer[..4], &crc_table);
 
         if chunk_type == IDAT {
             // Reserve space here so `extend_from_slice` is more efficient
@@ -493,7 +482,7 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
             let mut bytes_read = 0;
             while bytes_read < length {
                 let bytes_to_read = usize::min(length - bytes_read, BUFFER_SIZE);
-                reader.read_exact(&mut buffer[..bytes_to_read])?;
+                file.read_exact(&mut buffer[..bytes_to_read])?;
                 crc = update_crc(crc, &buffer[..bytes_to_read], &crc_table);
                 zlib_stream.extend_from_slice(&buffer[..bytes_to_read]);
                 bytes_read += bytes_to_read;
@@ -502,7 +491,7 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
             let mut bytes_read = 0;
             while bytes_read < length {
                 let bytes_to_read = usize::min(length - bytes_read, BUFFER_SIZE);
-                reader.read_exact(&mut buffer[..bytes_to_read])?;
+                file.read_exact(&mut buffer[..bytes_to_read])?;
                 crc = update_crc(crc, &buffer[..bytes_to_read], &crc_table);
                 bytes_read += bytes_to_read;
             }
@@ -510,8 +499,7 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
 
         // Need to invert the bits in the calculated CRC at the end so we XOR with 0xFFFFFFFF.
         crc ^= 0xFFFF_FFFF;
-        reader.read_exact(&mut buffer[..4])?;
-        let file_crc = u32::from_be_bytes(buffer[..4].try_into()?);
+        let file_crc = read_u32(&mut file)?;
         if file_crc != crc {
             return Err(Box::new(PngError::InvalidChunkCRC(file_crc, crc)));
         }
@@ -536,7 +524,7 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
 }
 
 #[no_mangle]
-pub extern "C" fn helium_get_metadata(
+pub extern "system" fn helium_get_metadata(
     #[cfg(windows)] file_name: *const u16,
     #[cfg(not(windows))] file_name: *const u8,
     metadata: *mut ImageMetadata,
@@ -575,21 +563,20 @@ pub extern "C" fn helium_get_metadata(
 }
 
 #[no_mangle]
-pub extern "C" fn helium_c(
+pub extern "system" fn helium_decode_png(
     #[cfg(windows)] file_name: *const u16,
     #[cfg(not(windows))] file_name: *const u8,
-    width: *mut u32,
-    height: *mut u32,
-    num_channels: *mut i32,
-    data: *mut *mut u8,
-) -> i32 {
+    png_data: *mut Helium_PngData,
+) -> u32 {
     if file_name.is_null() {
-        return -1;
+        return 1;
+    } else if png_data.is_null() {
+        return 2;
     }
 
-    let name = unsafe {
-        let length = (0..).take_while(|&i| *file_name.offset(i) != 0).count();
-        let slice = ManuallyDrop::new(slice::from_raw_parts(file_name, length));
+    let name = {
+        let length = (0..).take_while(|&i| unsafe { *file_name.offset(i) } != 0).count();
+        let slice = ManuallyDrop::new(unsafe { slice::from_raw_parts(file_name, length) });
         #[cfg(not(windows))]
         {
             use std::os::unix::ffi::OsStrExt;
@@ -603,25 +590,23 @@ pub extern "C" fn helium_c(
         }
     };
 
-    match name.to_str() {
-        Some(file_name) => match helium(file_name) {
-            Ok(i) => unsafe {
-                if !width.is_null() {
-                    *width = i.width;
-                }
-                if !height.is_null() {
-                    *height = i.height;
-                }
-                if !num_channels.is_null() {
-                    *num_channels = i.num_channels as i32;
-                }
-                if !data.is_null() {
-                    *data = i.data.leak().as_mut_ptr();
-                }
-            },
-            Err(_) => return 1,
-        },
-        None => return -2,
+    if let Some(n) = name.to_str() {
+        if let Ok(i) = helium(n) {
+            let p = Helium_PngData {
+                width: i.width,
+                height: i.height,
+                num_channels: i.num_channels,
+                data: i.data.leak().as_mut_ptr() as *mut _,
+            };
+
+            unsafe { *png_data = p; }
+        } else {
+            // Failed to decode the PNG file
+            return 4;
+        }
+    } else {
+        // Failed to create a valid UTF-8 encoded name from the given file name
+        return 3;
     }
 
     return 0;
