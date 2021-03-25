@@ -1,5 +1,8 @@
 mod metadata;
 
+#[global_allocator]
+static __: ::std::alloc::System = ::std::alloc::System;
+
 use std::{
     error::Error,
     ffi::c_void,
@@ -8,6 +11,7 @@ use std::{
     io::Read,
     mem::ManuallyDrop,
     slice,
+    time::Instant,
 };
 
 const BUFFER_SIZE: usize = 4 * 1024;
@@ -91,11 +95,15 @@ impl Header {
     fn parse(
         crc_table: &[u32; 256],
         file: &mut File,
-    ) -> Result<Self, Box<dyn Error>> {
+    ) -> Result<Self, PngError> {
         // First four bytes are the length and next four are the name of the header chunk. The length
         // must be 13 and the name must be a four-byte string "IHDR".
-        if !metadata::header_valid(file) { return Err(Box::new(PngError::InvalidHeader)); }
+        if !metadata::header_valid(file) {
+            return Err(PngError::InvalidHeader);
+        }
 
+        // NOTE: We do a manual read here as we need the bytes in a contiguous format for the
+        // `update_crc` function we use later on!
         let mut b = [0; 17];
         b[0] = 'I' as u8;
         b[1] = 'H' as u8;
@@ -116,19 +124,19 @@ impl Header {
         // and compression methods must both be zero. Finally, we only support images with bit-depths of
         // 8 bits-per-pixel.
         if interlace_method != 0 {
-            return Err(Box::new(PngError::UnsupportedInterlaceMethod));
+            return Err(PngError::UnsupportedInterlaceMethod);
         } else if filter_method != 0 {
-            return Err(Box::new(PngError::NonZeroFilterMethod));
+            return Err(PngError::NonZeroFilterMethod);
         } else if compression_method != 0 {
-            return Err(Box::new(PngError::NonZeroCompressionMethod));
+            return Err(PngError::NonZeroCompressionMethod);
         } else if bit_depth != 8 {
-            return Err(Box::new(PngError::UnsupportedBitDepth(bit_depth)));
+            return Err(PngError::UnsupportedBitDepth(bit_depth));
         }
 
         let crc = update_crc(0xFFFFFFFF, &b, crc_table) ^ 0xFFFFFFFF;
         let file_crc = read_u32(file)?;
         if file_crc != crc {
-            return Err(Box::new(PngError::InvalidChunkCRC(file_crc, crc)));
+            return Err(PngError::InvalidChunkCRC(file_crc, crc));
         }
 
         let bytes_per_pixel = metadata::bytes_per_pixel(colour_type) as usize;
@@ -142,7 +150,7 @@ impl Header {
 }
 
 #[repr(C)]
-pub struct Helium_PngData {
+pub struct HeliumPngData {
     pub width: u32,
     pub height: u32,
     pub num_channels: u32,
@@ -252,17 +260,37 @@ pub struct Image {
 }
 
 #[repr(C)]
-pub struct ImageMetadata {
+pub struct HeliumImageMetadata {
     width: u32,
     height: u32,
     bits_per_pixel: u32,
 }
 
+#[derive(Debug)]
 enum MetadataError {
     FileOpenError = 1,
     FileReadError = 2,
     InvalidMagicNumber = 3,
     InvalidHeader = 4,
+}
+
+impl Display for MetadataError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "")
+    }
+}
+
+impl Error for MetadataError {}
+
+impl From<std::io::Error> for MetadataError {
+    fn from(e: std::io::Error) -> Self {
+        use std::io::ErrorKind;
+
+        return match e.kind() {
+            ErrorKind::NotFound | ErrorKind::PermissionDenied => Self::FileOpenError,
+            _ => Self::FileReadError,
+        };
+    }
 }
 
 #[derive(Debug)]
@@ -273,6 +301,7 @@ enum PngError {
     NonZeroCompressionMethod,
     NonZeroFilterMethod,
     PartialOrOverReconstruction,
+    FileReadError,
     UnknownFilterType,
     UnsupportedBitDepth(u8),
     UnsupportedInterlaceMethod,
@@ -285,6 +314,12 @@ impl Display for PngError {
 }
 
 impl Error for PngError {}
+
+impl From<std::io::Error> for PngError {
+    fn from(_: std::io::Error) -> Self {
+        return PngError::FileReadError;
+    }
+}
 
 #[derive(Debug)]
 enum ZlibError {
@@ -429,35 +464,11 @@ fn generate_crc_table() -> [u32; NUM_8BIT_CRCS] {
     return table;
 }
 
-fn get_metadata(file_name: &str) -> Result<ImageMetadata, MetadataError> {
-    let mut file = File::open(file_name).map_err(|_| MetadataError::FileOpenError)?;
-
-    if !metadata::contains_magic_number(&mut file) {
-        return Err(MetadataError::InvalidMagicNumber);
-    }
-    if !metadata::header_valid(&mut file) {
-        return Err(MetadataError::InvalidHeader);
-    }
-
-    let width = read_u32(&mut file).map_err(|_| MetadataError::FileReadError)?;
-    let height = read_u32(&mut file).map_err(|_| MetadataError::FileReadError)?;
-
-    let bit_depth = read_u8(&mut file).map_err(|_| MetadataError::FileReadError)?;
-    let color_type = read_u8(&mut file).map_err(|_| MetadataError::FileReadError)?;
-    let bits_per_pixel = bit_depth as u32 * metadata::bytes_per_pixel(color_type);
-
-    let metadata = ImageMetadata {
-        width,
-        height,
-        bits_per_pixel,
-    };
-    return Ok(metadata);
-}
-
 pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
     let mut file = File::open(file_name)?;
     let mut buffer = [0; BUFFER_SIZE];
 
+    let mut start = Instant::now();
     // Generate a table of 32-bit CRC's of all possible 8-bit values.
     let crc_table = generate_crc_table();
 
@@ -466,6 +477,8 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
         return Err(Box::new(PngError::InvalidMagicNumber));
     }
     let header = Header::parse(&crc_table, &mut file)?;
+
+    println!("{}: ({}, {}) {}-bpp", file_name, header.width, header.height, header.bytes_per_pixel);
 
     // Collect zlib stream
     let mut zlib_stream = Vec::new();
@@ -504,16 +517,18 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
             return Err(Box::new(PngError::InvalidChunkCRC(file_crc, crc)));
         }
     }
+    let mut end = Instant::now();
+    println!("Parsing and accumulation finished in {:?}", end - start);
 
-    let mut start = std::time::Instant::now();
+    start = Instant::now();
     let inflated_stream = inflate(&zlib_stream, &header)?;
-    let mut end = std::time::Instant::now();
-    println!("{:?}", end - start);
+    end = Instant::now();
+    println!("Inflation finished in {:?}", end - start);
 
-    start = std::time::Instant::now();
+    start = Instant::now();
     let image_data = reconstruct(&inflated_stream, &header)?;
-    end = std::time::Instant::now();
-    println!("{:?}", end - start);
+    end = Instant::now();
+    println!("Image reconstruction finished in {:?}", end - start);
 
     return Ok(Image {
         width: header.width as u32,
@@ -527,7 +542,7 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
 pub extern "system" fn helium_get_metadata(
     #[cfg(windows)] file_name: *const u16,
     #[cfg(not(windows))] file_name: *const u8,
-    metadata: *mut ImageMetadata,
+    metadata: *mut HeliumImageMetadata,
 ) -> u32 {
     if file_name.is_null() {
         return 1;
@@ -535,9 +550,9 @@ pub extern "system" fn helium_get_metadata(
         return 2;
     }
 
-    let name = unsafe {
-        let length = (0..).take_while(|&i| *file_name.offset(i) != 0).count();
-        let slice = ManuallyDrop::new(slice::from_raw_parts(file_name, length));
+    let name = {
+        let length = (0..).take_while(|&i| unsafe { *file_name.offset(i) } != 0).count();
+        let slice = ManuallyDrop::new(unsafe { slice::from_raw_parts(file_name, length) });
         #[cfg(windows)]
         {
             use std::os::windows::ffi::OsStringExt;
@@ -551,7 +566,7 @@ pub extern "system" fn helium_get_metadata(
     };
 
     match name.to_str() {
-        Some(file_name) => match get_metadata(file_name) {
+        Some(file_name) => match metadata::get(file_name) {
             Ok(m) => unsafe { *metadata = m; },
             // NOTE: Add 3 since we already use 1, 2, and 3 and the enum discriminant starts at 1.
             Err(e) => return (e as u32) + 3,
@@ -566,7 +581,7 @@ pub extern "system" fn helium_get_metadata(
 pub extern "system" fn helium_decode_png(
     #[cfg(windows)] file_name: *const u16,
     #[cfg(not(windows))] file_name: *const u8,
-    png_data: *mut Helium_PngData,
+    png_data: *mut HeliumPngData,
 ) -> u32 {
     if file_name.is_null() {
         return 1;
@@ -577,26 +592,28 @@ pub extern "system" fn helium_decode_png(
     let name = {
         let length = (0..).take_while(|&i| unsafe { *file_name.offset(i) } != 0).count();
         let slice = ManuallyDrop::new(unsafe { slice::from_raw_parts(file_name, length) });
-        #[cfg(not(windows))]
-        {
-            use std::os::unix::ffi::OsStrExt;
-            std::ffi::OsStr::from_bytes(*slice)
-        }
-
         #[cfg(windows)]
         {
             use std::os::windows::ffi::OsStringExt;
             std::ffi::OsString::from_wide(*slice)
         }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            std::ffi::OsStr::from_bytes(*slice)
+        }
     };
 
     if let Some(n) = name.to_str() {
         if let Ok(i) = helium(n) {
-            let p = Helium_PngData {
+            // Wrap data in a `ManuallyDrop` in order to avoid calling the destructor.
+            // `std::mem::forget` can still lead to UB due to compiler assumptions!
+            let mut d = ManuallyDrop::new(i.data);
+            let p = HeliumPngData {
                 width: i.width,
                 height: i.height,
                 num_channels: i.num_channels,
-                data: i.data.leak().as_mut_ptr() as *mut _,
+                data: d.as_mut_ptr() as *mut c_void,
             };
 
             unsafe { *png_data = p; }
