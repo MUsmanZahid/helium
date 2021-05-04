@@ -1,3 +1,4 @@
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 mod metadata;
 
 #[global_allocator]
@@ -11,7 +12,6 @@ use std::{
     io::Read,
     mem::ManuallyDrop,
     slice,
-    time::Instant,
 };
 
 const BUFFER_SIZE: usize = 4 * 1024;
@@ -48,10 +48,10 @@ impl<'s> BitBuffer<'s> {
     /// Consumes count number of bits from the stream stored in the BitBuffer.
     /// Returns a 16-bit unsigned integer unless the stream has overflowed in which case it returns
     /// an error.
-    fn bits<'b>(&'b mut self, count: u8) -> Result<u16, ZlibError> {
+    fn bits(&mut self, count: u8) -> Result<u16, ZlibError> {
         let value = self.peek_bits(count)?;
         self.throw_bits(count);
-        return Ok(value as u16);
+        Ok(value as u16)
     }
 
     /// Retrieves count number of bits from the stream stored in the BitBuffer without consuming
@@ -59,7 +59,7 @@ impl<'s> BitBuffer<'s> {
     ///
     /// Returns a 16-bit unsigned integer unless the stream has overflowed, in which case it
     /// returns an error.
-    fn peek_bits<'b>(&'b mut self, count: u8) -> Result<u16, ZlibError> {
+    fn peek_bits(&mut self, count: u8) -> Result<u16, ZlibError> {
         // We try to store as many bits as we can at a given time in order to more successfully
         // predict this branch.
         if self.bit_count < count {
@@ -75,11 +75,11 @@ impl<'s> BitBuffer<'s> {
         }
 
         let value = self.bits & ((1u64 << count) - 1);
-        return Ok(value as u16);
+        Ok(value as u16)
     }
 
     /// Discards count bits from the BitBuffer.
-    fn throw_bits<'b>(&'b mut self, count: u8) {
+    fn throw_bits(&mut self, count: u8) {
         self.bits >>= count;
         self.bit_count -= count;
     }
@@ -92,10 +92,7 @@ struct Header {
 }
 
 impl Header {
-    fn parse(
-        crc_table: &[u32; 256],
-        file: &mut File,
-    ) -> Result<Self, PngError> {
+    fn parse(crc_table: &[u32; 256], file: &mut File) -> Result<Self, PngError> {
         // First four bytes are the length and next four are the name of the header chunk. The length
         // must be 13 and the name must be a four-byte string "IHDR".
         if !metadata::header_valid(file) {
@@ -105,10 +102,10 @@ impl Header {
         // NOTE: We do a manual read here as we need the bytes in a contiguous format for the
         // `update_crc` function we use later on!
         let mut b = [0; 17];
-        b[0] = 'I' as u8;
-        b[1] = 'H' as u8;
-        b[2] = 'D' as u8;
-        b[3] = 'R' as u8;
+        b[0] = b'I';
+        b[1] = b'H';
+        b[2] = b'D';
+        b[3] = b'R';
         file.read_exact(&mut b[4..17])?;
 
         // The fields of the IHDR chunk are ordered as retrieved below
@@ -145,7 +142,8 @@ impl Header {
             height,
             bytes_per_pixel,
         };
-        return Ok(header);
+
+        Ok(header)
     }
 }
 
@@ -163,57 +161,18 @@ struct HuffmanCode {
 }
 
 impl HuffmanCode {
-    /// Decodes the actual value from a given set of Huffman codes.
-    fn decode<'b, 's>(&'b self, bit_buffer: &'b mut BitBuffer<'s>) -> Result<u16, ZlibError> {
-        // Do not consume any bits from the buffer. The maximum number of bits we can have in a given
-        // Huffman code are 15.
-        let bits = bit_buffer.peek_bits(15)?.reverse_bits() >> 1;
-
-        // We process 5 codes in an interation to reduce unnecessary branchs in the for loop.
-        // Approximately speeds up decoding by 4-5%
-        for bit in (1..16).step_by(5) {
-            let mut code = bits >> (15 - bit);
-            let mut start = self.codes.get(bit).ok_or(ZlibError::InvalidBitLength)?;
-            let mut bit_codes = self.map.get(bit).ok_or(ZlibError::InvalidBitLength)?;
+    fn decode(&self, bit_buffer: &mut BitBuffer) -> Result<u16, ZlibError> {
+        let mut code = 0;
+        for bit in 0..15 {
+            code = (code << 1) | bit_buffer.bits(1)?;
+            let start = self.codes.get(bit + 1).ok_or(ZlibError::InvalidBitLength)?;
+            let bit_codes = self.map.get(bit + 1).ok_or(ZlibError::InvalidBitLength)?;
             if let Some(&value) = bit_codes.get((code - start) as usize) {
-                bit_buffer.throw_bits(bit as u8);
-                return Ok(value);
-            }
-
-            code = bits >> (14 - bit);
-            start = self.codes.get(bit + 1).ok_or(ZlibError::InvalidBitLength)?;
-            bit_codes = self.map.get(bit + 1).ok_or(ZlibError::InvalidBitLength)?;
-            if let Some(&value) = bit_codes.get((code - start) as usize) {
-                bit_buffer.throw_bits((bit + 1) as u8);
-                return Ok(value);
-            }
-
-            code = bits >> (13 - bit);
-            start = self.codes.get(bit + 2).ok_or(ZlibError::InvalidBitLength)?;
-            bit_codes = self.map.get(bit + 2).ok_or(ZlibError::InvalidBitLength)?;
-            if let Some(&value) = bit_codes.get((code - start) as usize) {
-                bit_buffer.throw_bits((bit + 2) as u8);
-                return Ok(value);
-            }
-
-            code = bits >> (12 - bit);
-            start = self.codes.get(bit + 3).ok_or(ZlibError::InvalidBitLength)?;
-            bit_codes = self.map.get(bit + 3).ok_or(ZlibError::InvalidBitLength)?;
-            if let Some(&value) = bit_codes.get((code - start) as usize) {
-                bit_buffer.throw_bits((bit + 3) as u8);
-                return Ok(value);
-            }
-
-            code = bits >> (11 - bit);
-            start = self.codes.get(bit + 4).ok_or(ZlibError::InvalidBitLength)?;
-            bit_codes = self.map.get(bit + 4).ok_or(ZlibError::InvalidBitLength)?;
-            if let Some(&value) = bit_codes.get((code - start) as usize) {
-                bit_buffer.throw_bits((bit + 4) as u8);
                 return Ok(value);
             }
         }
 
-        return Err(ZlibError::InvalidHuffmanCode);
+        Err(ZlibError::InvalidHuffmanCode)
     }
 
     /// Creates a new set of Huffman codes from an alphabet.
@@ -248,7 +207,7 @@ impl HuffmanCode {
             codes[bit] = start;
         }
 
-        return Self { codes, map };
+        Self { codes, map }
     }
 }
 
@@ -286,10 +245,10 @@ impl From<std::io::Error> for MetadataError {
     fn from(e: std::io::Error) -> Self {
         use std::io::ErrorKind;
 
-        return match e.kind() {
+        match e.kind() {
             ErrorKind::NotFound | ErrorKind::PermissionDenied => Self::FileOpenError,
             _ => Self::FileReadError,
-        };
+        }
     }
 }
 
@@ -317,7 +276,27 @@ impl Error for PngError {}
 
 impl From<std::io::Error> for PngError {
     fn from(_: std::io::Error) -> Self {
-        return PngError::FileReadError;
+        PngError::FileReadError
+    }
+}
+
+struct Timer {
+    now: std::time::Instant,
+}
+
+impl Timer {
+    fn checkpoint(&mut self) -> std::time::Duration {
+        let now = std::time::Instant::now();
+        let duration = now - self.now;
+        self.now = now;
+
+        duration
+    }
+
+    fn new() -> Self {
+        Self {
+            now: std::time::Instant::now(),
+        }
     }
 }
 
@@ -441,7 +420,7 @@ fn dynamic<'b, 's>(
 
     let literal_length = HuffmanCode::new(&ll_bit_lengths);
     let distance = HuffmanCode::new(&distance_bit_lengths);
-    return decode_block(bit_buffer, decoded_stream, &distance, &literal_length);
+    decode_block(bit_buffer, decoded_stream, &distance, &literal_length)
 }
 
 /// Direct port of the CRC table generation algorithm given in the PNG specification:
@@ -461,24 +440,23 @@ fn generate_crc_table() -> [u32; NUM_8BIT_CRCS] {
         *c = i as u32;
     }
 
-    return table;
+    table
 }
 
 pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
     let mut file = File::open(file_name)?;
     let mut buffer = [0; BUFFER_SIZE];
 
-    let mut start = Instant::now();
     // Generate a table of 32-bit CRC's of all possible 8-bit values.
     let crc_table = generate_crc_table();
+
+    let mut timer = Timer::new();
 
     // First 8-bytes of a PNG file are its identifying magic number
     if !metadata::contains_magic_number(&mut file) {
         return Err(Box::new(PngError::InvalidMagicNumber));
     }
     let header = Header::parse(&crc_table, &mut file)?;
-
-    println!("{}: ({}, {}) {}-bpp", file_name, header.width, header.height, header.bytes_per_pixel);
 
     // Collect zlib stream
     let mut zlib_stream = Vec::new();
@@ -487,6 +465,7 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
         let length = read_u32(&mut file)? as usize;
         file.read_exact(&mut buffer[..4])?;
         chunk_type.copy_from_slice(&buffer[..4]);
+
         let mut crc = update_crc(0xFFFF_FFFF, &buffer[..4], &crc_table);
 
         if chunk_type == IDAT {
@@ -517,25 +496,22 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
             return Err(Box::new(PngError::InvalidChunkCRC(file_crc, crc)));
         }
     }
-    let mut end = Instant::now();
-    println!("Parsing and accumulation finished in {:?}", end - start);
+    println!(
+        "Parsing and collection finished in {:?}",
+        timer.checkpoint()
+    );
 
-    start = Instant::now();
     let inflated_stream = inflate(&zlib_stream, &header)?;
-    end = Instant::now();
-    println!("Inflation finished in {:?}", end - start);
-
-    start = Instant::now();
+    println!("Inflation finished in {:?}", timer.checkpoint());
     let image_data = reconstruct(&inflated_stream, &header)?;
-    end = Instant::now();
-    println!("Image reconstruction finished in {:?}", end - start);
+    println!("Reconstruction finished in {:?}", timer.checkpoint());
 
-    return Ok(Image {
+    Ok(Image {
         width: header.width as u32,
         height: header.height as u32,
         num_channels: header.bytes_per_pixel as u32,
         data: image_data,
-    });
+    })
 }
 
 #[no_mangle]
@@ -551,7 +527,9 @@ pub extern "system" fn helium_get_metadata(
     }
 
     let name = {
-        let length = (0..).take_while(|&i| unsafe { *file_name.offset(i) } != 0).count();
+        let length = (0..)
+            .take_while(|&i| unsafe { *file_name.offset(i) } != 0)
+            .count();
         let slice = ManuallyDrop::new(unsafe { slice::from_raw_parts(file_name, length) });
         #[cfg(windows)]
         {
@@ -567,14 +545,16 @@ pub extern "system" fn helium_get_metadata(
 
     match name.to_str() {
         Some(file_name) => match metadata::get(file_name) {
-            Ok(m) => unsafe { *metadata = m; },
+            Ok(m) => unsafe {
+                *metadata = m;
+            },
             // NOTE: Add 3 since we already use 1, 2, and 3 and the enum discriminant starts at 1.
             Err(e) => return (e as u32) + 3,
         },
         None => return 3,
     }
 
-    return 0;
+    0
 }
 
 #[no_mangle]
@@ -590,7 +570,9 @@ pub extern "system" fn helium_decode_png(
     }
 
     let name = {
-        let length = (0..).take_while(|&i| unsafe { *file_name.offset(i) } != 0).count();
+        let length = (0..)
+            .take_while(|&i| unsafe { *file_name.offset(i) } != 0)
+            .count();
         let slice = ManuallyDrop::new(unsafe { slice::from_raw_parts(file_name, length) });
         #[cfg(windows)]
         {
@@ -616,7 +598,9 @@ pub extern "system" fn helium_decode_png(
                 data: d.as_mut_ptr() as *mut c_void,
             };
 
-            unsafe { *png_data = p; }
+            unsafe {
+                *png_data = p;
+            }
         } else {
             // Failed to decode the PNG file
             return 4;
@@ -626,7 +610,7 @@ pub extern "system" fn helium_decode_png(
         return 3;
     }
 
-    return 0;
+    0
 }
 
 /// Attempts to decode (inflate) a stream encoded by the DEFLATE codec.
@@ -722,9 +706,9 @@ fn inflate(zlib_stream: &[u8], header: &Header) -> Result<Vec<u8>, ZlibError> {
     }
 
     if decoded_stream.len() != num_bytes {
-        return Err(ZlibError::PartialStreamInflation);
+        Err(ZlibError::PartialStreamInflation)
     } else {
-        return Ok(decoded_stream);
+        Ok(decoded_stream)
     }
 }
 
@@ -760,14 +744,14 @@ fn read_u32(f: &mut File) -> std::io::Result<u32> {
     let mut b = [0; 4];
     f.read_exact(&mut b[..])?;
 
-    return Ok(u32::from_be_bytes(b));
+    Ok(u32::from_be_bytes(b))
 }
 
 fn read_u8(f: &mut File) -> std::io::Result<u8> {
     let mut b = [0; 1];
     f.read_exact(&mut b[..])?;
 
-    return Ok(b[0]);
+    Ok(b[0])
 }
 
 fn reconstruct(inflated_stream: &[u8], header: &Header) -> Result<Vec<u8>, PngError> {
@@ -877,9 +861,9 @@ fn reconstruct(inflated_stream: &[u8], header: &Header) -> Result<Vec<u8>, PngEr
     }
 
     if unfiltered_stream.len() != (scanline_width * header.height) {
-        return Err(PngError::PartialOrOverReconstruction);
+        Err(PngError::PartialOrOverReconstruction)
     } else {
-        return Ok(unfiltered_stream);
+        Ok(unfiltered_stream)
     }
 }
 
@@ -890,5 +874,5 @@ fn update_crc(mut crc: u32, buffer: &[u8], crc_table: &[u32; 256]) -> u32 {
         crc = crc_table[(crc ^ *i as u32) as usize & 0xFF] ^ (crc >> 8);
     }
 
-    return crc;
+    crc
 }

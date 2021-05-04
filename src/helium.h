@@ -1,6 +1,10 @@
 #ifndef HELIUM_H
 #define HELIUM_H
 
+#ifdef __cplusplus
+    extern "C" {
+#endif
+
 typedef struct HeliumImageMetadata {
     unsigned int width;
     unsigned int height;
@@ -43,5 +47,9 @@ unsigned int helium_get_metadata(
 #endif
     HeliumImageMetadata* metadata
 );
+
+#ifdef __cplusplus
+    }
+#endif
 
 #endif // HELIUM_H

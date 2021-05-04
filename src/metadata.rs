@@ -1,5 +1,5 @@
+use crate::{read_u32, read_u8, HeliumImageMetadata, MetadataError};
 use std::{fs::File, io::Read};
-use crate::{read_u8, read_u32, MetadataError, HeliumImageMetadata};
 
 // TODO: Don't panic here!
 pub(crate) fn bytes_per_pixel(color_type: u8) -> u32 {
@@ -15,11 +15,7 @@ pub(crate) fn bytes_per_pixel(color_type: u8) -> u32 {
 
 pub(crate) fn contains_magic_number(f: &mut File) -> bool {
     let mut b = [0u8; 8];
-    if let Err(_) = f.read_exact(&mut b[..]) {
-        return false;
-    }
-
-    return b == crate::PNG_MAGIC_NUMBER;
+    f.read_exact(&mut b[..]).is_ok() && (b == crate::PNG_MAGIC_NUMBER)
 }
 
 pub(crate) fn get(file_name: &str) -> Result<HeliumImageMetadata, MetadataError> {
@@ -43,7 +39,7 @@ pub(crate) fn get(file_name: &str) -> Result<HeliumImageMetadata, MetadataError>
         height,
         bits_per_pixel,
     };
-    return Ok(metadata);
+    Ok(metadata)
 }
 
 pub(crate) fn header_valid(f: &mut File) -> bool {
@@ -61,5 +57,5 @@ pub(crate) fn header_valid(f: &mut File) -> bool {
         return false;
     }
     // Chunk name must be IDAT
-    return b == crate::IHDR;
+    b == crate::IHDR
 }
