@@ -1,4 +1,8 @@
-use std::{error::Error, fs::File, io::{BufWriter, Write}};
+use std::{
+    error::Error,
+    fs::File,
+    io::{BufWriter, Write},
+};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args();
@@ -25,17 +29,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         let file = File::create(file_name)?;
         let mut writer = BufWriter::new(file);
         let header = format!("P6\n{} {}\n255\n", image.width, image.height);
-        writer.write(header.as_bytes())?;
+        writer.write_all(header.as_bytes())?;
 
         if image.num_channels == 3 {
-            writer.write(&image.data)?;
+            writer.write_all(&image.data)?;
         } else if image.num_channels == 4 {
             for pixel in 0..(image.width * image.height) as usize {
                 let pixel_index = 4 * pixel;
-                writer.write(&image.data[pixel_index..(pixel_index + 3)])?;
+                writer.write_all(&image.data[pixel_index..(pixel_index + 3)])?;
             }
         }
     }
 
-    return Ok(());
+    Ok(())
 }

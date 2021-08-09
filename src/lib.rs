@@ -175,6 +175,25 @@ impl HuffmanCode {
         Err(ZlibError::InvalidHuffmanCode)
     }
 
+    fn from_dynamic(hclen: usize, bit_buffer: &mut BitBuffer) -> Result<Self, ZlibError> {
+        let code_indices: [_; 19] = [
+            16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+        ];
+        let mut cc_bit_lengths = [0; 19];
+
+        for i in 0..hclen {
+            // None case can only happen due to PNG corruption as we've made the `code_indices` array
+            // the size of the maximum possible elements allowable by the standard.
+            let index = code_indices.get(i).ok_or(ZlibError::InvalidHCLEN)?;
+            // None case cannot happen, by construction. We avoid panicking here.
+            if let Some(value) = cc_bit_lengths.get_mut(*index as usize) {
+                *value = bit_buffer.bits(3)? as u8;
+            }
+        }
+
+        Ok(Self::new(&cc_bit_lengths))
+    }
+
     /// Creates a new set of Huffman codes from an alphabet.
     ///
     /// Takes a slice of unsigned 8-bit integers where each integer's index is its alphabet value
@@ -373,21 +392,7 @@ fn dynamic<'b, 's>(
     let hdist = ((header >> 5) & 0x1F) + 1;
     let hclen = (header >> 10) + 4;
 
-    let code_indices: [_; 19] = [
-        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
-    ];
-    let mut cc_bit_lengths = [0; 19];
-    for i in 0..hclen {
-        // None case can only happen due to PNG corruption as we've made the `code_indices` array
-        // the size of the maximum possible elements allowable by the standard.
-        let index = code_indices.get(i).ok_or(ZlibError::InvalidHCLEN)?;
-        // None case cannot happen, by construction. We avoid panicking here.
-        if let Some(value) = cc_bit_lengths.get_mut(*index as usize) {
-            *value = bit_buffer.bits(3)? as u8;
-        }
-    }
-
-    let cc = HuffmanCode::new(&cc_bit_lengths);
+    let cc = HuffmanCode::from_dynamic(hclen, bit_buffer)?;
     let mut code_lengths = vec![0; hlit + hdist];
     let mut num_decoded = 0;
     let mut last_code = 0;
@@ -401,15 +406,10 @@ fn dynamic<'b, 's>(
             _ => return Err(ZlibError::InvalidCodeLength),
         };
 
-        // Need to repeat at-least once
-        code_lengths[num_decoded] = code_to_repeat;
-        num_decoded += 1;
-
-        for _ in 1..repeat {
+        for _ in 0..repeat {
             code_lengths[num_decoded] = code_to_repeat;
             num_decoded += 1;
         }
-
         last_code = code_to_repeat;
     }
 
@@ -468,24 +468,16 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
 
         let mut crc = update_crc(0xFFFF_FFFF, &buffer[..4], &crc_table);
 
-        if chunk_type == IDAT {
-            // Reserve space here so `extend_from_slice` is more efficient
-            zlib_stream.reserve(length);
-            let mut bytes_read = 0;
-            while bytes_read < length {
-                let bytes_to_read = usize::min(length - bytes_read, BUFFER_SIZE);
-                file.read_exact(&mut buffer[..bytes_to_read])?;
-                crc = update_crc(crc, &buffer[..bytes_to_read], &crc_table);
-                zlib_stream.extend_from_slice(&buffer[..bytes_to_read]);
-                bytes_read += bytes_to_read;
-            }
-        } else {
-            let mut bytes_read = 0;
-            while bytes_read < length {
-                let bytes_to_read = usize::min(length - bytes_read, BUFFER_SIZE);
-                file.read_exact(&mut buffer[..bytes_to_read])?;
-                crc = update_crc(crc, &buffer[..bytes_to_read], &crc_table);
-                bytes_read += bytes_to_read;
+        let mut bytes_read = 0;
+        while bytes_read < length {
+            let bytes_to_read = usize::min(length - bytes_read, BUFFER_SIZE);
+            let buffer = &mut buffer[..bytes_to_read];
+            file.read_exact(buffer)?;
+            crc = update_crc(crc, buffer, &crc_table);
+            bytes_read += bytes_to_read;
+
+            if chunk_type == IDAT {
+                zlib_stream.extend_from_slice(buffer);
             }
         }
 
@@ -520,10 +512,8 @@ pub extern "system" fn helium_get_metadata(
     #[cfg(not(windows))] file_name: *const u8,
     metadata: *mut HeliumImageMetadata,
 ) -> u32 {
-    if file_name.is_null() {
+    if file_name.is_null() || metadata.is_null() {
         return 1;
-    } else if metadata.is_null() {
-        return 2;
     }
 
     let name = {
@@ -548,8 +538,8 @@ pub extern "system" fn helium_get_metadata(
             Ok(m) => unsafe {
                 *metadata = m;
             },
-            // NOTE: Add 3 since we already use 1, 2, and 3 and the enum discriminant starts at 1.
-            Err(e) => return (e as u32) + 3,
+            // Add 1 since we already use 1 and the enum discriminant starts at 1.
+            Err(e) => return (e as u32) + 1,
         },
         None => return 3,
     }
@@ -720,7 +710,6 @@ fn inflate(zlib_stream: &[u8], header: &Header) -> Result<Vec<u8>, ZlibError> {
 /// the previous scanline, and let `c` be the byte in a's position in the previous scanline. This
 /// function tries to find in which of the three direction's (vertical, horizontal, and diagonal)
 /// the gradient is the smallest.
-#[inline]
 fn paeth(a: u8, b: u8, c: u8) -> u8 {
     let a16 = a as i16;
     let b16 = b as i16;
