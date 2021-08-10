@@ -85,6 +85,7 @@ impl<'s> BitBuffer<'s> {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
 struct Header {
     width: usize,
     height: usize,
@@ -493,10 +494,21 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
         timer.checkpoint()
     );
 
-    let inflated_stream = inflate(&zlib_stream, &header)?;
-    println!("Inflation finished in {:?}", timer.checkpoint());
-    let image_data = reconstruct(&inflated_stream, &header)?;
-    println!("Reconstruction finished in {:?}", timer.checkpoint());
+    let (scanline_tx, scanline_rx) = std::sync::mpsc::channel();
+    let decoder = std::thread::spawn(move || inflate_mt(scanline_tx, zlib_stream, header));
+    let (raw_tx, raw_rx) = std::sync::mpsc::channel();
+    let reconstructor = std::thread::spawn(move || unfilter(scanline_rx, raw_tx, header));
+
+    let image_data = raw_rx.iter().flatten().collect();
+    println!("Decoding finished in {:?}", timer.checkpoint());
+
+    decoder.join().unwrap()?;
+    reconstructor.join().unwrap()?;
+
+    // let inflated_stream = inflate(&zlib_stream, &header)?;
+    // println!("Inflation finished in {:?}", timer.checkpoint());
+    // let image_data = reconstruct(&inflated_stream, &header)?;
+    // println!("Reconstruction finished in {:?}", timer.checkpoint());
 
     Ok(Image {
         width: header.width as u32,
@@ -601,6 +613,14 @@ pub extern "system" fn helium_decode_png(
     }
 
     0
+}
+
+fn inflate_mt(
+    scanline_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    zlib_stream: Vec<u8>,
+    header: Header,
+) -> Result<(), ZlibError> {
+    Ok(())
 }
 
 /// Attempts to decode (inflate) a stream encoded by the DEFLATE codec.
@@ -741,6 +761,20 @@ fn read_u8(f: &mut File) -> std::io::Result<u8> {
     f.read_exact(&mut b[..])?;
 
     Ok(b[0])
+}
+
+fn unfilter(
+    scanline_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    raw_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    header: Header,
+) -> Result<(), PngError> {
+    let bppo = header.bytes_per_pixel + 1;
+    let scanline_width = header.bytes_per_pixel * header.width;
+    let filter_byte_index = scanline_width + 1;
+
+    // let mut previous_scanline = None;
+
+    Ok(())
 }
 
 fn reconstruct(inflated_stream: &[u8], header: &Header) -> Result<Vec<u8>, PngError> {
