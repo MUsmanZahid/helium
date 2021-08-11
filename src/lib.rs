@@ -1,4 +1,4 @@
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(dead_code)]
 mod metadata;
 
 #[global_allocator]
@@ -615,12 +615,304 @@ pub extern "system" fn helium_decode_png(
     0
 }
 
+const MAX_LOOK_BACK: usize = 32768;
+struct RingBuffer {
+    buffer: Box<[u8; MAX_LOOK_BACK]>,
+    position: usize,
+    length: usize,
+}
+
+impl RingBuffer {
+    fn get(&self, index: usize) -> Option<u8> {
+        ((index < self.length) && (index < MAX_LOOK_BACK))
+            .then(|| self.buffer[self.position + index % MAX_LOOK_BACK])
+    }
+
+    fn new() -> Self {
+        Self {
+            buffer: Box::new([0; MAX_LOOK_BACK]),
+            position: 0,
+            length: 0,
+        }
+    }
+
+    fn push(&mut self, value: u8) {
+        self.buffer[self.position + self.length % MAX_LOOK_BACK] = value;
+        if self.length < MAX_LOOK_BACK {
+            self.length += 1;
+        }
+    }
+}
+
+enum BlockCompressionType {
+    None,
+    Fixed,
+    Dynamic,
+}
+
+/// Remainders left-over from when the decoder is interrupted during a critical stage in a block.
+enum DecoderRemainder {
+    /// Obtained when the decoder is interrupted while expanding a non-compressed block.
+    Length(usize),
+    /// Obtained when the decoder is interrupted while expanding a pointer from a compressed block.
+    ///
+    /// A pointer is a (`length`, `distance`) pair. `length` signifies how many bytes remain
+    /// to be copied. `distance` signifies the distance to look back in the decoding process to
+    /// find the byte to copy.
+    Pointer(u16, u16),
+}
+
+/// Describes the format of a Z-LIB block as well as whether or not the decoder had any remainders
+/// left from a previous pass.
+struct BlockInfo {
+    final_block: bool,
+    compression_type: BlockCompressionType,
+    remainder: Option<DecoderRemainder>,
+}
+
+/// Stores required elements of the Z-LIB decoder as well as additional state-tracking information.
+struct DecoderState<'b> {
+    bit_buffer: BitBuffer<'b>,
+    ring_buffer: RingBuffer,
+    block_info: Option<BlockInfo>,
+}
+
+impl<'b> DecoderState<'b> {
+    fn new(byte_stream: &'b [u8]) -> Self {
+        let bit_buffer = BitBuffer {
+            bits: 0,
+            bit_count: 0,
+            index: 0,
+            length: byte_stream.len(),
+            stream: byte_stream,
+        };
+
+        Self {
+            bit_buffer,
+            ring_buffer: RingBuffer::new(),
+            block_info: None,
+        }
+    }
+}
+
 fn inflate_mt(
     scanline_tx: std::sync::mpsc::Sender<Vec<u8>>,
     zlib_stream: Vec<u8>,
     header: Header,
 ) -> Result<(), ZlibError> {
+    let cmf = zlib_stream[0];
+    let cm = cmf & 0xF;
+    if cm != 8 {
+        return Err(ZlibError::InvalidCompressionMethod);
+    }
+
+    let cinfo = cmf >> 4;
+    if cinfo > 7 {
+        return Err(ZlibError::InvalidWindowLength);
+    }
+
+    let flg = zlib_stream[1];
+    let integer = ((cmf as u16) << 8) | (flg as u16);
+    if (integer % 31) != 0 {
+        return Err(ZlibError::InvalidFCHECK);
+    }
+
+    let fdict = (flg & 0x20) >> 5;
+    if fdict == 1 {
+        return Err(ZlibError::PresetDictionaryPresent);
+    }
+
+    let mut decoder_state = DecoderState::new(&zlib_stream[2..]);
+    for _ in 0..header.height {
+        let (state, scanline) =
+            decode_bytes(decoder_state, header.bytes_per_pixel * header.width + 1)?;
+        decoder_state = state;
+        scanline_tx.send(scanline).unwrap();
+    }
+
     Ok(())
+}
+
+/// Decode a partially decoded block.
+///
+/// This function continues the decoding process of the block described by `block_info` taking
+/// into account any remainders left while previously decoding the block.
+///
+/// NOTE: This function assumes that the `bytes` Vec has `count` capacity in order to not cause
+/// re-allocations while decoding.
+fn decode_continued(
+    mut bytes: Vec<u8>,
+    bit_buffer: &mut BitBuffer<'_>,
+    ring_buffer: &mut RingBuffer,
+    mut block_info: Option<BlockInfo>,
+    count: usize,
+) -> Result<(Option<BlockInfo>, Vec<u8>), ZlibError> {
+    while bytes.len() < count {
+        // Continuing in the middle of a left-over block.
+        if let Some(block_info) = block_info {
+            // Continuing in the middle of a critical-section.
+            if let Some(remainder) = block_info {
+                // Work through the remainder first and then re-engage the normal decoders.
+                match remainder {
+                    DecoderRemainder::Length(remaining) => {
+                        // TODO: This can panic if bytes.len() > count. Can that case happen?
+                        let difference = count - bytes.len();
+                        let n = if remaining > difference {
+                            block_info.remainder = Some(DecoderRemainder::Length(remaining - difference));
+                            difference
+                        } else {
+                            block_info.remainder = None;
+                            remaining
+                        };
+
+                        for _ in 0..n {
+                            bytes.push(bit_buffer.bits(8)? as u8);
+                        }
+                    },
+                    DecoderRemainder::Pointer(length, distance) => {
+                    },
+                }
+            } else {
+                // No remainder was present.
+                match block_info.compression_type {
+                    BlockCompressionType::None => {},
+                    BlockCompressionType::Fixed => {},
+                    BlockCompressionType::Dynamic => {},
+                }
+            }
+        } else {
+        }
+
+        block_info = {};
+    }
+
+    Ok((block_info, bytes))
+
+    if let Some(block_info) = block_info {
+        // Continuing from a previous block!
+        match block_info.remainder {
+            Some(DecoderRemainder::Length(remaining)) => {
+                // TODO: This can panic if bytes.len() > count. Can that case happen?
+                let difference = count - bytes.len();
+                if remaining < difference {
+                    for _ in 0..remaining {
+                        bytes.push(bit_buffer.bits(8)? as u8);
+                    }
+
+                    block_info.remainder = DecoderRemainder::None;
+                } else if remaining > difference {
+                    block_info.remainder = DecoderRemainder::Length(remaining - difference);
+                } else {
+                    block_info.remainder = DecoderRemainder::None;
+                }
+            },
+            Some(DecoderRemainder::Pointer(remaining_length, distance)) => {},
+            None => {
+                // Continue decoding the block
+                // Here, we could either return after reaching `count` decoded bytes or after the
+                // end of the block. We implicitly know that, if the length of `bytes` is less than
+                // count the block must have ended and no more bytes could have been decompressed.
+                match block_info.compression_type {
+                    // No remainder for a block with no compression means that there are no more
+                    // bytes left in the block and, hence, we have to start decoding a new block.
+                    BlockCompressionType::None => {},
+                    // Can have additional information after the pointer remainder.
+                    BlockCompressionType::Fixed =>
+                        decode_fixed_continued(
+                            &mut bytes,
+                            bit_buffer,
+                            ring_buffer,
+                            block_info,
+                            count
+                        ),
+                    // Can have additional information after the pointer remainder.
+                    BlockCompressionType::Dynamic =>
+                        decode_dynamic_continued(
+                            &mut bytes,
+                            bit_buffer,
+                            ring_buffer,
+                            block_info,
+                            count
+                        ),
+                }
+
+                if bytes.len() < count {
+                    // Start of a new block!
+                } else {
+                    return Ok((Some(block_info), bytes));
+                }
+            },
+        }
+    } else {
+        // Start of new block!
+    }
+
+    if bytes.len() < count {
+        // Start of a new block!
+    } else {
+        block_info.remainder = None;
+        Ok((Some(block_info), bytes))
+    }
+}
+
+/// Begin decoding a new block.
+///
+/// This function assumes that the bit-stream is at the start of a new Z-LIB block. It decodes the
+/// block header and then hands off to [`decode_continued`].
+///
+/// NOTE: This function assumes that the `bytes` Vec has `count` capacity in order to not cause
+/// re-allocations while decoding.
+fn decode_new(
+    bytes: Vec<u8>,
+    bit_buffer: &mut BitBuffer<'_>,
+    ring_buffer: &mut RingBuffer,
+    count: usize
+) -> Result<(Option<BlockInfo>, Vec<u8>), ZlibError> {
+    let final_block = bit_buffer.bits(1)? == 1;
+    let compression_type = match bit_buffer.bits(2)? {
+        0 => BlockCompressionType::None,
+        1 => BlockCompressionType::Fixed,
+        2 => BlockCompressionType::Dynamic,
+        _ => return Err(ZlibError::UnknownBlockCompression),
+    };
+
+    let block_info = BlockInfo {
+        final_block,
+        compression_type,
+        remainder: None,
+    };
+
+    decode_continued(bytes, bit_buffer, ring_buffer, block_info, count)
+}
+
+/// Decode `count` bytes from a Z-LIB stream.
+///
+/// This function manages state tracking in order to be able to return to the call-site after
+/// decoding `count` bytes from the Z-LIB compressed stream and be able to correctly pick-up where
+/// it left-off from previous runs.
+fn decode_bytes(
+    mut state: DecoderState,
+    count: usize
+) -> Result<(DecoderState, Vec<u8>), ZlibError> {
+    let mut bytes = Vec::with_capacity(count);
+    while bytes.len() < count {
+        let (new_block_info, new_bytes) = if let Some(block_info) = state.block_info {
+            decode_continued(
+                bytes,
+                &mut state.bit_buffer,
+                &mut state.ring_buffer,
+                block_info,
+                count
+            )?
+        } else {
+            decode_new(bytes, &mut state.bit_buffer, &mut state.ring_buffer, count)?
+        };
+
+        state.block_info = new_block_info;
+        bytes = new_bytes;
+    }
+
+    Ok((state, bytes))
 }
 
 /// Attempts to decode (inflate) a stream encoded by the DEFLATE codec.
@@ -768,11 +1060,89 @@ fn unfilter(
     raw_tx: std::sync::mpsc::Sender<Vec<u8>>,
     header: Header,
 ) -> Result<(), PngError> {
-    let bppo = header.bytes_per_pixel + 1;
     let scanline_width = header.bytes_per_pixel * header.width;
-    let filter_byte_index = scanline_width + 1;
+    let mut previous_scanline = vec![0; scanline_width];
+    for mut scanline in scanline_rx.recv() {
+        let filter = scanline[0];
+        scanline.remove(0);
+        assert_eq!(scanline.len(), previous_scanline.len());
 
-    // let mut previous_scanline = None;
+        let scanline = match filter {
+            // None
+            0 => scanline,
+            // Subtract
+            1 => {
+                // The bytes to the left of the first pixel in a scanline are to be set to 0.
+                // Therefore the bytes for the first pixel remain the same for this filter.
+                for i in header.bytes_per_pixel..scanline_width {
+                    let a = scanline[i - header.bytes_per_pixel];
+                    let x = scanline[i];
+                    let (value, _) = x.overflowing_add(a);
+                    scanline[i] = value;
+                }
+
+                scanline
+            }
+            // Up
+            2 => scanline
+                .into_iter()
+                .zip(previous_scanline.iter())
+                .map(|(x, b)| {
+                    let (value, _) = x.overflowing_add(*b);
+                    value
+                })
+                .collect(),
+            // Average
+            3 => {
+                for i in 0..header.bytes_per_pixel {
+                    let x = scanline[i];
+                    let b = previous_scanline[i];
+                    let (value, _) = x.overflowing_add(b / 2);
+
+                    scanline[i] = value;
+                }
+
+                for i in header.bytes_per_pixel..scanline_width {
+                    let a = scanline[i - header.bytes_per_pixel] as u16;
+                    let x = scanline[i];
+                    let b = previous_scanline[i] as u16;
+                    let (value, _) = x.overflowing_add((a + b) as u8 / 2);
+
+                    scanline[i] = value;
+                }
+
+                scanline
+            },
+            // Paeth
+            4 => {
+                for i in 0..header.bytes_per_pixel {
+                    let x = scanline[i];
+                    let b = previous_scanline[i];
+                    let (value, _) = x.overflowing_add(paeth(0, b, 0));
+
+                    scanline[i] = value;
+                }
+
+                for i in header.bytes_per_pixel..scanline_width {
+                    let a = scanline[i - header.bytes_per_pixel];
+                    let x = scanline[i];
+                    let c = previous_scanline[i - header.bytes_per_pixel];
+                    let b = previous_scanline[i];
+                    let (value, _) = x.overflowing_add(paeth(a, b, c));
+
+                    scanline[i] = value;
+                }
+
+                scanline
+            },
+            _ => return Err(PngError::UnknownFilterType),
+        };
+
+        // NOTE: We can assert here that the length of the replacing Vec and the previous Vec is the
+        // same. Hopefully that can improve codegen?
+        previous_scanline = scanline.clone();
+        raw_tx.send(scanline).unwrap();
+    }
 
     Ok(())
 }
