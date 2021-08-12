@@ -229,6 +229,48 @@ impl HuffmanCode {
 
         Self { codes, map }
     }
+
+    /// Parse a set of literal/length and distance Huffman codes from a Z-LIB block with dynamic
+    /// Huffman tree generation.
+    ///
+    /// Returns the tuple of Huffman codes (literal/length, distance) upon success.
+    fn parse_dynamic(bit_buffer: &mut BitBuffer<'_>) -> Result<(Self, Self), ZlibError> {
+        let header = bit_buffer.bits(14)? as usize;
+        let hlit = (header & 0x1F) + 257;
+        let hdist = ((header >> 5) & 0x1F) + 1;
+        let hclen = (header >> 10) + 4;
+
+        let cc = Self::from_dynamic(hclen, bit_buffer)?;
+        let mut code_lengths = vec![0; hlit + hdist];
+        let mut num_decoded = 0;
+        let mut last_code = 0;
+
+        while num_decoded < code_lengths.capacity() {
+            let (repeat, code_to_repeat) = match cc.decode(bit_buffer)? {
+                x @ 0..=15 => (1, x as u8),
+                16 => (3 + bit_buffer.bits(2)?, last_code),
+                17 => (3 + bit_buffer.bits(3)?, 0),
+                18 => (11 + bit_buffer.bits(7)?, 0),
+                _ => return Err(ZlibError::InvalidCodeLength),
+            };
+
+            for _ in 0..repeat {
+                code_lengths[num_decoded] = code_to_repeat;
+                num_decoded += 1;
+            }
+            last_code = code_to_repeat;
+        }
+
+        let mut ll_bit_lengths = [0; 287];
+        ll_bit_lengths[..hlit].copy_from_slice(&code_lengths[..hlit]);
+        let mut distance_bit_lengths = [0; 32];
+        distance_bit_lengths[..hdist].copy_from_slice(&code_lengths[hlit..]);
+
+        let literal_length = Self::new(&ll_bit_lengths);
+        let distance = Self::new(&distance_bit_lengths);
+
+        Ok((literal_length, distance))
+    }
 }
 
 pub struct Image {
@@ -495,14 +537,13 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
     );
 
     let (scanline_tx, scanline_rx) = std::sync::mpsc::channel();
-    let decoder = std::thread::spawn(move || inflate_mt(scanline_tx, zlib_stream, header));
     let (raw_tx, raw_rx) = std::sync::mpsc::channel();
     let reconstructor = std::thread::spawn(move || unfilter(scanline_rx, raw_tx, header));
+    inflate_mt(scanline_tx, zlib_stream, header)?;
 
     let image_data = raw_rx.iter().flatten().collect();
     println!("Decoding finished in {:?}", timer.checkpoint());
 
-    decoder.join().unwrap()?;
     reconstructor.join().unwrap()?;
 
     // let inflated_stream = inflate(&zlib_stream, &header)?;
@@ -615,42 +656,56 @@ pub extern "system" fn helium_decode_png(
     0
 }
 
-const MAX_LOOK_BACK: usize = 32768;
 struct RingBuffer {
-    buffer: Box<[u8; MAX_LOOK_BACK]>,
+    buffer: Box<[u8; Self::MAX_LOOK_BACK]>,
     position: usize,
     length: usize,
 }
 
 impl RingBuffer {
+    const MAX_LOOK_BACK: usize = 32768;
+
     fn get(&self, index: usize) -> Option<u8> {
-        ((index < self.length) && (index < MAX_LOOK_BACK))
-            .then(|| self.buffer[self.position + index % MAX_LOOK_BACK])
+        if (0 < index) && (index < self.length) {
+            if index <= self.position {
+                Some(self.buffer[self.position - index])
+            } else {
+                Some(self.buffer[self.length - index + self.position])
+            }
+        } else {
+            None
+        }
     }
 
     fn new() -> Self {
         Self {
-            buffer: Box::new([0; MAX_LOOK_BACK]),
+            buffer: Box::new([0; Self::MAX_LOOK_BACK]),
             position: 0,
             length: 0,
         }
     }
 
     fn push(&mut self, value: u8) {
-        self.buffer[self.position + self.length % MAX_LOOK_BACK] = value;
-        if self.length < MAX_LOOK_BACK {
+        self.buffer[self.position] = value;
+        self.position = (self.position + 1) % Self::MAX_LOOK_BACK;
+        if self.length < Self::MAX_LOOK_BACK {
             self.length += 1;
         }
     }
 }
 
+/// Compression variants than can be present in a Z-LIB stream.
 enum BlockCompressionType {
+    /// Block has not been compressed.
     None,
+    /// Block has been compressed with a set of fixed (implicit) Huffman trees.
     Fixed,
+    /// Block has been compressed with a set of dynamically generated Huffman trees.
     Dynamic,
 }
 
 /// Remainders left-over from when the decoder is interrupted during a critical stage in a block.
+#[derive(Clone, Copy, Debug)]
 enum DecoderRemainder {
     /// Obtained when the decoder is interrupted while expanding a non-compressed block.
     Length(usize),
@@ -667,6 +722,7 @@ enum DecoderRemainder {
 struct BlockInfo {
     final_block: bool,
     compression_type: BlockCompressionType,
+    stream_codes: Option<(HuffmanCode, HuffmanCode)>,
     remainder: Option<DecoderRemainder>,
 }
 
@@ -733,156 +789,105 @@ fn inflate_mt(
     Ok(())
 }
 
-/// Decode a partially decoded block.
-///
-/// This function continues the decoding process of the block described by `block_info` taking
-/// into account any remainders left while previously decoding the block.
-///
-/// NOTE: This function assumes that the `bytes` Vec has `count` capacity in order to not cause
-/// re-allocations while decoding.
-fn decode_continued(
-    mut bytes: Vec<u8>,
+fn decode_huffman(
+    literal_length: &HuffmanCode,
+    distance: &HuffmanCode,
     bit_buffer: &mut BitBuffer<'_>,
     ring_buffer: &mut RingBuffer,
-    mut block_info: Option<BlockInfo>,
+    bytes: &mut Vec<u8>,
     count: usize,
-) -> Result<(Option<BlockInfo>, Vec<u8>), ZlibError> {
+) -> Result<Result<bool, DecoderRemainder>, ZlibError> {
     while bytes.len() < count {
-        // Continuing in the middle of a left-over block.
-        if let Some(block_info) = block_info {
-            // Continuing in the middle of a critical-section.
-            if let Some(remainder) = block_info {
-                // Work through the remainder first and then re-engage the normal decoders.
-                match remainder {
-                    DecoderRemainder::Length(remaining) => {
-                        // TODO: This can panic if bytes.len() > count. Can that case happen?
-                        let difference = count - bytes.len();
-                        let n = if remaining > difference {
-                            block_info.remainder = Some(DecoderRemainder::Length(remaining - difference));
-                            difference
-                        } else {
-                            block_info.remainder = None;
-                            remaining
-                        };
-
-                        for _ in 0..n {
-                            bytes.push(bit_buffer.bits(8)? as u8);
-                        }
-                    },
-                    DecoderRemainder::Pointer(length, distance) => {
-                    },
-                }
-            } else {
-                // No remainder was present.
-                match block_info.compression_type {
-                    BlockCompressionType::None => {},
-                    BlockCompressionType::Fixed => {},
-                    BlockCompressionType::Dynamic => {},
-                }
+        match literal_length.decode(bit_buffer)? {
+            x @ 0..=255 => {
+                let x = x as u8;
+                ring_buffer.push(x);
+                bytes.push(x);
             }
-        } else {
-        }
+            256 => return Ok(Ok(true)),
+            x @ 257..=285 => {
+                // Get length
+                let length_index = x as usize - 257;
+                let extra_bits = LENGTH_EXTRA_BITS[length_index];
+                let extra_length = bit_buffer.bits(extra_bits)?;
+                let length = (LENGTHS[length_index] + extra_length) as usize;
 
-        block_info = {};
-    }
+                // Get distance
+                let distance_index = match distance.decode(bit_buffer) {
+                    Ok(x @ 0..=29) => x as usize,
+                    _ => return Err(ZlibError::InvalidDistance),
+                };
+                let extra_bits = DISTANCE_EXTRA_BITS[distance_index];
+                let extra_distance = bit_buffer.bits(extra_bits)?;
+                let distance = (DISTANCES[distance_index] + extra_distance) as usize;
 
-    Ok((block_info, bytes))
-
-    if let Some(block_info) = block_info {
-        // Continuing from a previous block!
-        match block_info.remainder {
-            Some(DecoderRemainder::Length(remaining)) => {
-                // TODO: This can panic if bytes.len() > count. Can that case happen?
-                let difference = count - bytes.len();
-                if remaining < difference {
+                // NOTE: This *cannot* panic because, before entering the `match` block we check
+                // that `bytes.len() < count` and any earlier instructions do not add to the length
+                // of `bytes`. Hence, it should still be the case that `bytes.len() < count` and
+                // thus a panic should not occur.
+                let remaining = count - bytes.len();
+                if length <= remaining {
+                    for _ in 0..length {
+                        let value = ring_buffer
+                            .get(distance)
+                            .expect("Attempted to retrieve non-existent value from ring buffer!");
+                        bytes.push(value);
+                        ring_buffer.push(value);
+                    }
+                } else {
                     for _ in 0..remaining {
-                        bytes.push(bit_buffer.bits(8)? as u8);
+                        let value = ring_buffer
+                            .get(distance)
+                            .expect("Attempted to retrieve non-existent value from a ring buffer!");
+                        bytes.push(value);
+                        ring_buffer.push(value);
                     }
 
-                    block_info.remainder = DecoderRemainder::None;
-                } else if remaining > difference {
-                    block_info.remainder = DecoderRemainder::Length(remaining - difference);
-                } else {
-                    block_info.remainder = DecoderRemainder::None;
+                    let remainder_length = length - remaining;
+                    return Ok(Err(DecoderRemainder::Pointer(
+                        remainder_length as u16,
+                        distance as u16,
+                    )));
                 }
-            },
-            Some(DecoderRemainder::Pointer(remaining_length, distance)) => {},
-            None => {
-                // Continue decoding the block
-                // Here, we could either return after reaching `count` decoded bytes or after the
-                // end of the block. We implicitly know that, if the length of `bytes` is less than
-                // count the block must have ended and no more bytes could have been decompressed.
-                match block_info.compression_type {
-                    // No remainder for a block with no compression means that there are no more
-                    // bytes left in the block and, hence, we have to start decoding a new block.
-                    BlockCompressionType::None => {},
-                    // Can have additional information after the pointer remainder.
-                    BlockCompressionType::Fixed =>
-                        decode_fixed_continued(
-                            &mut bytes,
-                            bit_buffer,
-                            ring_buffer,
-                            block_info,
-                            count
-                        ),
-                    // Can have additional information after the pointer remainder.
-                    BlockCompressionType::Dynamic =>
-                        decode_dynamic_continued(
-                            &mut bytes,
-                            bit_buffer,
-                            ring_buffer,
-                            block_info,
-                            count
-                        ),
-                }
-
-                if bytes.len() < count {
-                    // Start of a new block!
-                } else {
-                    return Ok((Some(block_info), bytes));
-                }
-            },
+            }
+            _ => return Err(ZlibError::InvalidLiteralLength),
         }
-    } else {
-        // Start of new block!
     }
 
-    if bytes.len() < count {
-        // Start of a new block!
-    } else {
-        block_info.remainder = None;
-        Ok((Some(block_info), bytes))
-    }
+    Ok(Ok(false))
 }
 
-/// Begin decoding a new block.
+/// Decode a Z-LIB block that has been encoded with a set of dynamic Huffman trees.
 ///
-/// This function assumes that the bit-stream is at the start of a new Z-LIB block. It decodes the
-/// block header and then hands off to [`decode_continued`].
-///
-/// NOTE: This function assumes that the `bytes` Vec has `count` capacity in order to not cause
-/// re-allocations while decoding.
-fn decode_new(
-    bytes: Vec<u8>,
+/// Returns `true` if the block's data was exhausted and `false` otherwise.
+fn decode_dynamic(
     bit_buffer: &mut BitBuffer<'_>,
     ring_buffer: &mut RingBuffer,
-    count: usize
-) -> Result<(Option<BlockInfo>, Vec<u8>), ZlibError> {
-    let final_block = bit_buffer.bits(1)? == 1;
-    let compression_type = match bit_buffer.bits(2)? {
-        0 => BlockCompressionType::None,
-        1 => BlockCompressionType::Fixed,
-        2 => BlockCompressionType::Dynamic,
-        _ => return Err(ZlibError::UnknownBlockCompression),
-    };
+    stream_codes: &mut Option<(HuffmanCode, HuffmanCode)>,
+    bytes: &mut Vec<u8>,
+    count: usize,
+) -> Result<Result<bool, DecoderRemainder>, ZlibError> {
+    let mut block_ended = false;
 
-    let block_info = BlockInfo {
-        final_block,
-        compression_type,
-        remainder: None,
-    };
+    while (bytes.len() < count) && !block_ended {
+        if let Some((ref literal_length, ref distance)) = stream_codes {
+            match decode_huffman(
+                literal_length,
+                distance,
+                bit_buffer,
+                ring_buffer,
+                bytes,
+                count,
+            )? {
+                Ok(block_status) => block_ended = block_status,
+                Err(remainder) => return Ok(Err(remainder)),
+            }
+        } else {
+            *stream_codes = Some(HuffmanCode::parse_dynamic(bit_buffer)?);
+        }
+    }
 
-    decode_continued(bytes, bit_buffer, ring_buffer, block_info, count)
+    Ok(Ok(block_ended))
 }
 
 /// Decode `count` bytes from a Z-LIB stream.
@@ -892,24 +897,115 @@ fn decode_new(
 /// it left-off from previous runs.
 fn decode_bytes(
     mut state: DecoderState,
-    count: usize
+    count: usize,
 ) -> Result<(DecoderState, Vec<u8>), ZlibError> {
     let mut bytes = Vec::with_capacity(count);
     while bytes.len() < count {
-        let (new_block_info, new_bytes) = if let Some(block_info) = state.block_info {
-            decode_continued(
-                bytes,
-                &mut state.bit_buffer,
-                &mut state.ring_buffer,
-                block_info,
-                count
-            )?
-        } else {
-            decode_new(bytes, &mut state.bit_buffer, &mut state.ring_buffer, count)?
-        };
+        if let Some(ref mut block_info) = state.block_info {
+            // Continuing in the middle of a left-over block.
+            if let Some(remainder) = block_info.remainder {
+                // Remainder present.
+                match remainder {
+                    DecoderRemainder::Length(remaining) => {
+                        let len = bytes.len();
+                        if len < count {
+                            let difference = count - len;
+                            let n = if remaining > difference {
+                                block_info.remainder =
+                                    Some(DecoderRemainder::Length(remaining - difference));
+                                difference
+                            } else {
+                                block_info.remainder = None;
+                                remaining
+                            };
 
-        state.block_info = new_block_info;
-        bytes = new_bytes;
+                            for _ in 0..n {
+                                bytes.push(state.bit_buffer.bits(8)? as u8);
+                            }
+                        }
+                    }
+                    DecoderRemainder::Pointer(length, distance) => {
+                        let byte_len = bytes.len();
+                        if byte_len < count {
+                            let length = length as usize;
+
+                            let difference = count - byte_len;
+                            let n = if length > difference {
+                                block_info.remainder = Some(DecoderRemainder::Pointer(
+                                    (length - difference) as u16,
+                                    distance,
+                                ));
+                                difference
+                            } else {
+                                block_info.remainder = None;
+                                length
+                            };
+
+                            for _ in 0..n {
+                                let value = state.ring_buffer.get(distance as usize).expect(
+                                    "Attempted to read a non-existent portion of the ring buffer!",
+                                );
+                                bytes.push(value);
+                                state.ring_buffer.push(value);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // No remainder was present. Continue decoding the current block.
+                //
+                // Two cases can emerge when in this block:
+                // 1. We finished decoding the block,
+                // 2. We decoded `count` bytes before finishing the block,
+                let decoding_result = match block_info.compression_type {
+                    // No remainder for a block with no compression means that there are no more
+                    // bytes left in the block and, hence, we have to start decoding a new block.
+                    BlockCompressionType::None => Ok(true),
+                    // Can have additional information after the pointer remainder.
+                    BlockCompressionType::Fixed => {
+                        todo!("Fixed decoding path!")
+                        // decode_fixed(&mut state, &mut bytes, count),
+                    }
+                    // Can have additional information after the pointer remainder.
+                    BlockCompressionType::Dynamic => decode_dynamic(
+                        &mut state.bit_buffer,
+                        &mut state.ring_buffer,
+                        &mut block_info.stream_codes,
+                        &mut bytes,
+                        count,
+                    )?,
+                };
+
+                match decoding_result {
+                    // Done with the current block
+                    Ok(true) => state.block_info = None,
+                    // Finished decoding `count` bytes before reaching the end of the block.
+                    // Don't need to do anything here.
+                    Ok(false) => {}
+                    Err(remainder) => block_info.remainder = Some(remainder),
+                }
+            }
+        } else {
+            // Starting at a new block
+
+            // TODO: We might not care about the `final_block` field since over-running the
+            // `bit_buffer` will result in an error and we may want to handle over-reads in that
+            // manner.
+            let final_block = state.bit_buffer.bits(1)? == 1;
+            let compression_type = match state.bit_buffer.bits(2)? {
+                0 => BlockCompressionType::None,
+                1 => BlockCompressionType::Fixed,
+                2 => BlockCompressionType::Dynamic,
+                _ => return Err(ZlibError::UnknownBlockCompression),
+            };
+
+            state.block_info = Some(BlockInfo {
+                final_block,
+                compression_type,
+                stream_codes: None,
+                remainder: None,
+            });
+        }
     }
 
     Ok((state, bytes))
@@ -1062,7 +1158,7 @@ fn unfilter(
 ) -> Result<(), PngError> {
     let scanline_width = header.bytes_per_pixel * header.width;
     let mut previous_scanline = vec![0; scanline_width];
-    for mut scanline in scanline_rx.recv() {
+    for mut scanline in scanline_rx.iter() {
         let filter = scanline[0];
         scanline.remove(0);
         assert_eq!(scanline.len(), previous_scanline.len());
@@ -1112,7 +1208,7 @@ fn unfilter(
                 }
 
                 scanline
-            },
+            }
             // Paeth
             4 => {
                 for i in 0..header.bytes_per_pixel {
@@ -1134,7 +1230,7 @@ fn unfilter(
                 }
 
                 scanline
-            },
+            }
             _ => return Err(PngError::UnknownFilterType),
         };
 
