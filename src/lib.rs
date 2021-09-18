@@ -763,37 +763,47 @@ fn reconstruct(inflated: Vec<u8>, header: Header) -> Result<Vec<u8>, PngError> {
     let mut reconstructed = Vec::with_capacity(header.height * scanline_width);
 
     let mut index = 0;
-    for _scanline in 0..header.height {
-        let filter = inflated[index];
-        index += 1;
+    // Closure that takes in the current value of `index`, and a kernel function for each scanline
+    // that will reverse the specific filter for that scanline.
+    let mut per_scanline = |idx, f: fn(FilterComponents, u8) -> u8| {
+        let mut i = idx;
 
         for pixel in 0..header.width {
             for component in 0..header.bytes_per_pixel {
                 let offset = pixel * header.bytes_per_pixel + component;
                 let bytes = buffer[offset];
-                let v = match filter {
-                    0 => inflated[index],
-                    1 => inflated[index].overflowing_add(bytes.a).0,
-                    2 => inflated[index].overflowing_add(bytes.b).0,
-                    3 => {
-                        let avg = bytes.a as u16 + bytes.b as u16;
-                        inflated[index].overflowing_add((avg / 2) as u8).0
-                    }
-                    4 => {
-                        let paeth = paeth(bytes.a, bytes.b, bytes.c);
-                        inflated[index].overflowing_add(paeth).0
-                    }
-                    _ => return Err(PngError::UnknownFilterType),
-                };
 
+                let value = f(bytes, inflated[i]);
                 buffer[offset].c = bytes.a;
-                buffer[offset].b = v;
-                buffer[offset + header.bytes_per_pixel].a = v;
+                buffer[offset].b = value;
+                buffer[offset + header.bytes_per_pixel].a = value;
 
-                reconstructed.push(v);
-                index += 1;
+                reconstructed.push(value);
+                i += 1;
             }
         }
+    };
+
+    for _scanline in 0..header.height {
+        let filter = inflated[index];
+        index += 1;
+
+        match filter {
+            0 => per_scanline(index, |_, current_byte| current_byte),
+            1 => per_scanline(index, |bytes, current_byte| current_byte.overflowing_add(bytes.a).0),
+            2 => per_scanline(index, |bytes, current_byte| current_byte.overflowing_add(bytes.b).0),
+            3 => per_scanline(index, |bytes, current_byte| {
+                let avg = bytes.a as u16 + bytes.b as u16;
+                current_byte.overflowing_add((avg / 2) as u8).0
+            }),
+            4 => per_scanline(index, |bytes, current_byte| {
+                let paeth = paeth(bytes.a, bytes.b, bytes.c);
+                current_byte.overflowing_add(paeth).0
+            }),
+            _ => return Err(PngError::UnknownFilterType),
+        }
+
+        index += header.width * header.bytes_per_pixel;
     }
 
     if reconstructed.len() != (scanline_width * header.height) {
