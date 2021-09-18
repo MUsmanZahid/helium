@@ -85,6 +85,7 @@ impl<'s> BitBuffer<'s> {
     }
 }
 
+#[derive(Clone, Copy)]
 struct Header {
     width: usize,
     height: usize,
@@ -163,10 +164,10 @@ struct HuffmanCode {
 impl HuffmanCode {
     fn decode(&self, bit_buffer: &mut BitBuffer) -> Result<u16, ZlibError> {
         let mut code = 0;
-        for bit in 0..15 {
+        for bit in 1..16 {
             code = (code << 1) | bit_buffer.bits(1)?;
-            let start = self.codes.get(bit + 1).ok_or(ZlibError::InvalidBitLength)?;
-            let bit_codes = self.map.get(bit + 1).ok_or(ZlibError::InvalidBitLength)?;
+            let start = self.codes.get(bit).ok_or(ZlibError::InvalidBitLength)?;
+            let bit_codes = self.map.get(bit).ok_or(ZlibError::InvalidBitLength)?;
             if let Some(&value) = bit_codes.get((code - start) as usize) {
                 return Ok(value);
             }
@@ -495,7 +496,7 @@ pub fn helium(file_name: &str) -> Result<Image, Box<dyn Error>> {
 
     let inflated_stream = inflate(&zlib_stream, &header)?;
     println!("Inflation finished in {:?}", timer.checkpoint());
-    let image_data = reconstruct(&inflated_stream, &header)?;
+    let image_data = reconstruct(inflated_stream, header)?;
     println!("Reconstruction finished in {:?}", timer.checkpoint());
 
     Ok(Image {
@@ -743,116 +744,62 @@ fn read_u8(f: &mut File) -> std::io::Result<u8> {
     Ok(b[0])
 }
 
-fn reconstruct(inflated_stream: &[u8], header: &Header) -> Result<Vec<u8>, PngError> {
-    let bppo = header.bytes_per_pixel + 1;
+#[derive(Clone, Copy)]
+struct FilterComponents {
+    a: u8,
+    b: u8,
+    c: u8,
+}
+
+#[inline(never)]
+fn reconstruct(inflated: Vec<u8>, header: Header) -> Result<Vec<u8>, PngError> {
+    if inflated.len() < (header.bytes_per_pixel * header.width + 1) * header.height {
+        return Err(PngError::PartialOrOverReconstruction);
+    }
+
     let scanline_width = header.bytes_per_pixel * header.width;
-    let mut unfiltered_stream = Vec::with_capacity(scanline_width * header.height);
-    let filter_byte_index = scanline_width + 1;
+    let mut buffer =
+        vec![FilterComponents { a: 0, b: 0, c: 0 }; scanline_width + header.bytes_per_pixel];
+    let mut reconstructed = Vec::with_capacity(header.height * scanline_width);
 
-    // We start to reconstruct the PNG image from the inflated ZLIB (DEFLATE) stream. There are five
-    // filter methods present in the PNG specification:
-    // 0 (None) -> ,
-    // 1 (Sub) -> ,
-    // 2 (Up) -> ,
-    // 3 (Average) -> ,
-    // 4 (Paeth) -> ,
-    match inflated_stream[0] {
-        0 | 2 => unfiltered_stream.extend_from_slice(&inflated_stream[1..filter_byte_index]),
-        1 => {
-            unfiltered_stream.extend_from_slice(&inflated_stream[1..bppo]);
-            for byte in bppo..filter_byte_index {
-                let x = inflated_stream[byte];
-                let a = unfiltered_stream[byte - bppo];
-                let (value, _) = x.overflowing_add(a);
-                unfiltered_stream.push(value);
+    let mut index = 0;
+    for _scanline in 0..header.height {
+        let filter = inflated[index];
+        index += 1;
+
+        for pixel in 0..header.width {
+            for component in 0..header.bytes_per_pixel {
+                let offset = pixel * header.bytes_per_pixel + component;
+                let bytes = buffer[offset];
+                let v = match filter {
+                    0 => inflated[index],
+                    1 => inflated[index].overflowing_add(bytes.a).0,
+                    2 => inflated[index].overflowing_add(bytes.b).0,
+                    3 => {
+                        let avg = bytes.a as u16 + bytes.b as u16;
+                        inflated[index].overflowing_add((avg / 2) as u8).0
+                    }
+                    4 => {
+                        let paeth = paeth(bytes.a, bytes.b, bytes.c);
+                        inflated[index].overflowing_add(paeth).0
+                    }
+                    _ => return Err(PngError::UnknownFilterType),
+                };
+
+                buffer[offset].c = bytes.a;
+                buffer[offset].b = v;
+                buffer[offset + header.bytes_per_pixel].a = v;
+
+                reconstructed.push(v);
+                index += 1;
             }
-        }
-        3 => {
-            // First pixel: We don't have pixel to the left and we don't have a pixel to the top.
-            unfiltered_stream.extend_from_slice(&inflated_stream[1..bppo]);
-            // Rest: Only have a pixel to the left, not above.
-            for byte in bppo..scanline_width {
-                let (value, _) =
-                    inflated_stream[byte].overflowing_add(unfiltered_stream[byte - bppo]);
-                unfiltered_stream.push(value >> 1);
-            }
-        }
-        4 => todo!("Paeth"),
-        _ => return Err(PngError::UnknownFilterType),
-    };
-
-    for scanline in 1..header.height {
-        let filter_byte = scanline * filter_byte_index;
-        let first_byte = filter_byte + 1;
-        let unfiltered_cs = scanline * scanline_width;
-        let unfiltered_ps = (scanline - 1) * scanline_width;
-
-        match inflated_stream[filter_byte] {
-            0 => unfiltered_stream.extend_from_slice(
-                &inflated_stream[(filter_byte + 1)..(filter_byte + filter_byte_index)],
-            ),
-            1 => {
-                unfiltered_stream.extend_from_slice(
-                    &inflated_stream[first_byte..(first_byte + header.bytes_per_pixel)],
-                );
-                for byte in bppo..filter_byte_index {
-                    let x = inflated_stream[filter_byte + byte];
-                    let a = unfiltered_stream[unfiltered_cs + byte - bppo];
-                    let (value, _) = x.overflowing_add(a);
-                    unfiltered_stream.push(value);
-                }
-            }
-            2 => {
-                for byte in 0..scanline_width {
-                    let x = inflated_stream[first_byte + byte];
-                    let b = unfiltered_stream[unfiltered_ps + byte];
-                    let (value, _) = x.overflowing_add(b);
-                    unfiltered_stream.push(value);
-                }
-            }
-            3 => {
-                for byte in 0..header.bytes_per_pixel {
-                    let x = inflated_stream[first_byte + byte];
-                    let b = unfiltered_stream[unfiltered_ps + byte];
-                    let (value, _) = x.overflowing_add(b >> 1);
-                    unfiltered_stream.push(value);
-                }
-
-                for byte in bppo..filter_byte_index {
-                    let x = inflated_stream[filter_byte + byte];
-                    let b = unfiltered_stream[unfiltered_ps + byte - 1] as u16;
-                    let a = unfiltered_stream[unfiltered_cs + byte - bppo] as u16;
-
-                    let (value, _) = x.overflowing_add(((a + b) >> 1) as u8);
-                    unfiltered_stream.push(value);
-                }
-            }
-            4 => {
-                for byte in 0..header.bytes_per_pixel {
-                    let x = inflated_stream[first_byte + byte];
-                    let b = unfiltered_stream[unfiltered_ps + byte];
-                    let (value, _) = x.overflowing_add(paeth(0, b, 0));
-                    unfiltered_stream.push(value);
-                }
-
-                for byte in bppo..filter_byte_index {
-                    let x = inflated_stream[filter_byte + byte];
-                    let c = unfiltered_stream[unfiltered_ps + byte - bppo];
-                    let b = unfiltered_stream[unfiltered_ps + byte - 1];
-                    let a = unfiltered_stream[unfiltered_cs + byte - bppo];
-
-                    let (value, _) = x.overflowing_add(paeth(a, b, c));
-                    unfiltered_stream.push(value);
-                }
-            }
-            _ => return Err(PngError::UnknownFilterType),
         }
     }
 
-    if unfiltered_stream.len() != (scanline_width * header.height) {
+    if reconstructed.len() != (scanline_width * header.height) {
         Err(PngError::PartialOrOverReconstruction)
     } else {
-        Ok(unfiltered_stream)
+        Ok(reconstructed)
     }
 }
 

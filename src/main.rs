@@ -2,6 +2,7 @@ use std::{
     error::Error,
     fs::File,
     io::{BufWriter, Write},
+    time,
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -22,7 +23,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         None => false,
     };
 
+    let begin = time::Instant::now();
     let image = helium::helium(&file_name)?;
+    let end = time::Instant::now();
     if write_ppm {
         file_name += ".ppm";
 
@@ -40,6 +43,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     }
+
+    let size = image.data.len() as f64 / (0x1 << 30) as f64;
+    let time = (end - begin).as_secs_f64();
+    println!("Decoded at {} GB/s", size / time);
 
     Ok(())
 }
